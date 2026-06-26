@@ -2,6 +2,8 @@
 build/
 dist/
 *.spec
+*.exe
+*.exe.bak
 log.md
 __pycache__/
 *.pyc

@@ -31,7 +31,7 @@ def log_error(func):
     def wrapper(*args, **kwargs):
         try:
             func(*args, **kwargs)
-        except BaseException as e:
+        except Exception as e:
             logger.error(f"Error in thread {threading.current_thread().name}: {e}")
             traceback.print_exception(type(e), e, e.__traceback__)
             raise
@@ -401,6 +401,7 @@ class JobProcessor:
         self.config = config
 
     def run(self):
+        completed = True
         for task in self.tasks:
             self.task_queue.put(task)
 
@@ -409,11 +410,36 @@ class JobProcessor:
             self.threads.append(thread)
             thread.start()
 
-        threading.Thread(target=self.retry_thread, daemon=True).start()
+        retry_thread = threading.Thread(target=self.retry_thread, daemon=True)
+        retry_thread.start()
 
-        self.task_queue.join()
+        # 入队全部完成后等待处理完毕，同时监控 worker 线程存活状态
+        _join_start = time.time()
+        _join_timeout = max(1800, len(self.tasks) * 120)  # 最少 30 分钟
+        while self.task_queue.unfinished_tasks > 0:
+            # 检查是否所有 worker 线程都已死亡
+            alive_workers = [t for t in self.threads if t.is_alive()]
+            if not alive_workers and self.task_queue.unfinished_tasks > 0:
+                logger.error(
+                    "所有 worker 线程已意外终止，剩余 {} 个未完成任务，强制退出",
+                    self.task_queue.unfinished_tasks,
+                )
+                completed = False
+                break
+            if time.time() - _join_start > _join_timeout:
+                logger.error(
+                    "任务处理超时 ({}s)，剩余 {} 个未完成任务，强制退出",
+                    int(time.time() - _join_start),
+                    self.task_queue.unfinished_tasks,
+                )
+                completed = False
+                break
+            time.sleep(1)
+
         time.sleep(0.5)
         self.task_queue.shutdown()
+        self.retry_queue.shutdown()
+        return completed and not self.failed_tasks
 
 
     @log_error
@@ -434,7 +460,7 @@ class JobProcessor:
                     logger.debug(f"unfinished task: {self.task_queue.unfinished_tasks}")
 
                 case ChapterResult.NOT_OPEN:
-                    # task.tries += 1
+                    task.tries += 1
                     if self.config["notopen_action"] == "continue":
                         logger.warning("章节未开启: {}, 正在跳过", task.point["title"])
                         self.task_queue.task_done()
@@ -445,6 +471,7 @@ class JobProcessor:
                             "章节未开启: {} 可能由于上一章节的章节检测未完成, 也可能由于该章节因为时效已关闭，"
                             "请手动检查完成并提交再重试。或者在配置中配置(自动跳过关闭章节/开启题库并启用提交)"
                         , task.point["title"])
+                        self.failed_tasks.append(task)
                         self.task_queue.task_done()
                         continue
 
@@ -472,10 +499,14 @@ class JobProcessor:
         try:
             while True:
                 task = self.retry_queue.get()
-                self.task_queue.put(task)
-                # task_done is not called when a task failed and needs to be retried so if is reinserted into the queue,
-                # the task num will increase by one and become more than the real task number
-                self.task_queue.task_done()
+                try:
+                    self.task_queue.put(task)
+                    # task_done is not called when a task failed and needs to be retried so if is reinserted into the queue,
+                    # the task num will increase by one and become more than the real task number
+                    self.task_queue.task_done()
+                except ShutDown:
+                    # task_queue 已关闭，无法再重试
+                    break
                 time.sleep(1) # TODO: Replace with a configurable wait time
         except ShutDown:
             pass
@@ -576,7 +607,8 @@ def process_course(chaoxing: Chaoxing, course:dict[str, Any], config: dict):
         task = ChapterTask(point=point, index=i)
         tasks.append(task)
     p = JobProcessor(chaoxing, course, tasks, config)
-    p.run()
+    if not p.run():
+        raise RuntimeError(f"课程任务未全部完成: {course['title']}")
 
 def filter_courses(all_course, course_list):
     """过滤要学习的课程"""
@@ -652,16 +684,17 @@ def main():
         if e.code != 0:
             logger.error(f"错误: 程序异常退出, 返回码: {e.code}")
         sys.exit(e.code)
-    except KeyboardInterrupt as e:
-        logger.error(f"错误: 程序被用户手动中断, {e}")
-    except BaseException as e:
+    except KeyboardInterrupt:
+        logger.info("程序被用户手动中断")
+        # 不重新抛出，让 exec() 正常返回以回到菜单
+    except Exception as e:
         logger.error(f"错误: {type(e).__name__}: {e}")
         logger.error(traceback.format_exc())
         try:
             notification.send(f"chaoxing : 出现错误 {type(e).__name__}: {e}\n{traceback.format_exc()}")
         except Exception:
             pass  # 如果通知发送失败，忽略异常
-        raise e
+        raise
 
 
 if __name__ == "__main__":

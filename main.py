@@ -65,13 +65,18 @@ def _run_frozen(cwd, script_args, name):
         pass
     except KeyboardInterrupt:
         print(f"\n[{name}] interrupted by user")
-    except Exception as e:
-        print(f"\n[{name}] error: {e}")
+    except BaseException as e:
+        print(f"\n[{name}] fatal error ({type(e).__name__}): {e}")
+        import traceback as _tb
+        _tb.print_exc()
     finally:
         sys.argv = old_argv
         os.chdir(old_cwd)
         sys.path[:] = old_path
-    input("\n按任意键返回菜单...")
+    try:
+        input("\n按任意键返回菜单...")
+    except (EOFError, KeyboardInterrupt):
+        pass
 
 
 def _run_subprocess(cwd, script_args, name):
@@ -89,13 +94,15 @@ def _run_subprocess(cwd, script_args, name):
         )
         if result.returncode != 0:
             print(f"\n[{name}] exited with code {result.returncode}")
-        input("\n按任意键返回菜单...")
     except KeyboardInterrupt:
         print(f"\n[{name}] interrupted by user")
-        input("\n按任意键返回菜单...")
     except Exception as e:
         print(f"\n[{name}] error: {e}")
-        input("\n按任意键返回菜单...")
+    finally:
+        try:
+            input("\n按任意键返回菜单...")
+        except (EOFError, KeyboardInterrupt):
+            pass
 
 
 def run_chaoxing():

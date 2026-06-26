@@ -274,13 +274,17 @@ class Chaoxing:
         }
         logger.trace("正在尝试登录...")
         resp = _session.post(_url, headers=gc.HEADERS, data=_data)
-        if resp and resp.json()["status"] == True:
+        try:
+            login_data = resp.json()
+        except (ValueError, requests.JSONDecodeError):
+            return {"status": False, "msg": f"登录响应解析失败: {resp.text[:200]}"}
+        if resp and login_data.get("status") == True:
             save_cookies(_session)
             SessionManager.update_cookies()
             logger.info("登录成功...")
             return {"status": True, "msg": "登录成功"}
         else:
-            return {"status": False, "msg": str(resp.json()["msg2"])}
+            return {"status": False, "msg": str(login_data.get("msg2", "未知错误"))}
 
     def _validate_cookie_session(self) -> bool:
         session = SessionManager.get_instance()._session
@@ -367,7 +371,12 @@ class Chaoxing:
             logger.debug("Request url: " + resp.url)
             return []
 
-        data = resp.json()
+        try:
+            data = resp.json()
+        except (ValueError, requests.JSONDecodeError):
+            logger.error("Failed to parse activity list response")
+            return []
+
         if data["result"] != 1:
             logger.error("Unknown status: {} {}", data["result"], data["errorMsg"])
             logger.debug("Request url: " + resp.url)
@@ -492,6 +501,14 @@ class Chaoxing:
             f"[{clazzId}][{userid}][{jobid}][{objectId}][{playingTime * 1000}][d_yHJ!$pdA~5][{duration * 1000}][0_{duration}]"
             .encode()).hexdigest()
 
+    @staticmethod
+    def _safe_json(resp, default=None):
+        """安全解析 JSON，响应非 JSON 时返回 default"""
+        try:
+            return resp.json()
+        except (ValueError, requests.JSONDecodeError):
+            return default
+
     def video_progress_log(
             self,
             _session,
@@ -572,7 +589,11 @@ class Chaoxing:
                 resp = _session.get(_url, params=params, headers=headers)
                 if resp.status_code == 200:
                     logger.trace(resp.text)
-                    return resp.json()["isPassed"], 200
+                    data = self._safe_json(resp)
+                    if data and "isPassed" in data:
+                        return data["isPassed"], 200
+                    logger.warning("响应200但非有效JSON, jobid={}", _job.get("jobid"))
+                    return False, 502
                 # elif resp.ok:
                 #    # TODO: 处理验证码
                 #    pass
@@ -588,7 +609,13 @@ class Chaoxing:
 
         if resp.status_code == 200:
             logger.trace(resp.text)
-            return resp.json()["isPassed"], 200
+            data = self._safe_json(resp)
+            if data and "isPassed" in data:
+                return data["isPassed"], 200
+            logger.warning("响应200但非有效JSON, jobid={}, 摘要:\n{}",
+                           _job.get("jobid"),
+                           resp.text[:200])
+            return False, 502
 
         elif resp.status_code == 403:
             logger.debug(
@@ -629,7 +656,7 @@ class Chaoxing:
 
         try:
             data = resp.json()
-        except ValueError as exc:
+        except (ValueError, requests.JSONDecodeError) as exc:
             logger.debug("解析视频状态响应失败: {}", exc)
             return None
 
@@ -660,7 +687,11 @@ class Chaoxing:
 
         headers = gc.VIDEO_HEADERS if _type == "Video" else gc.AUDIO_HEADERS
         _info_url = f"https://mooc1.chaoxing.com/ananas/status/{_job['objectid']}?k={self.get_fid()}&flag=normal"
-        _video_info = _session.get(_info_url, headers=headers).json()
+        try:
+            _video_info = _session.get(_info_url, headers=headers).json()
+        except (ValueError, requests.JSONDecodeError, requests.RequestException) as e:
+            logger.error("获取视频信息失败: {}", e)
+            return StudyResult.ERROR
 
         if _video_info["status"] != "success":
             logger.error(f"Unknown status: {_video_info['status']}")
