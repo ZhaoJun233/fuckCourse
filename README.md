@@ -1,5 +1,7 @@
 # fuckCourse v3.0.0-dev
 
+> 本项目基于上游仓库 [sheshuyu/fuckCourse](https://github.com/sheshuyu/fuckCourse) 开发，并在此基础上进行维护、修复与打包发布。
+
 超星学习通 / WE Learn / 智慧树 / 雨课堂 四合一自动刷课工具。
 
 ## 项目结构
@@ -7,6 +9,7 @@
 ```
 ├── main.py                  # 统一启动器，菜单选择平台 (subprocess 调度)
 ├── config.json              # 统一配置（首次运行自动生成）
+├── config.example.json      # 已脱敏配置模板
 ├── cookies.json             # 统一 cookies（登录后自动保存）
 ├── requirements.txt         # Python 依赖
 ├── log.md                   # 更新日志

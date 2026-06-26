@@ -1,0 +1,89 @@
+{
+  "chaoxing": {
+    "common": {
+      "username": "",
+      "password": "",
+      "speed": 1.0,
+      "jobs": 4,
+      "notopen_action": "retry",
+      "course_list": [],
+      "use_cookies": true,
+      "tree_view": true
+    },
+    "tiku": {
+      "provider": "AI",
+      "submit": "true",
+      "cover_rate": "0.8",
+      "true_list": "正确,对,√,是",
+      "false_list": "错误,错,×,否",
+      "tokens": "",
+      "go_authorization": "",
+      "go_min_interval": "1.0",
+      "go_retry_times": "3",
+      "go_retry_backoff": "1.2",
+      "likeapi_search": false,
+      "likeapi_model": null,
+      "likeapi_vision": true,
+      "likeapi_retry": true,
+      "likeapi_retry_times": 3,
+      "url": "",
+      "endpoint": "",
+      "key": "",
+      "model": "",
+      "http_proxy": "",
+      "min_interval_seconds": "1",
+      "siliconflow_endpoint": "",
+      "siliconflow_key": "",
+      "siliconflow_model": "deepseek-ai/DeepSeek-V3",
+      "check_llm_connection": "true",
+      "delay": 0
+    },
+    "notification": {
+      "provider": "",
+      "url": "",
+      "tg_chat_id": ""
+    }
+  },
+  "zhs": {
+    "username": "",
+    "password": "",
+    "qrlogin": true,
+    "save_cookies": true,
+    "proxies": {},
+    "logLevel": "INFO",
+    "tree_view": true,
+    "progressbar_view": true,
+    "qr_extra": {
+      "show_in_terminal": null,
+      "ensure_unicode": false
+    },
+    "image_path": "",
+    "pushplus": {
+      "enable": false,
+      "token": ""
+    },
+    "bark": {
+      "enable": false,
+      "token": ""
+    },
+    "config_version": "1.4.0",
+    "ai": {
+      "enabled": true,
+      "use_zhidao_ai": true,
+      "openai": {
+        "api_base": "https://api.openai.com",
+        "api_key": "",
+        "model_name": ""
+      },
+      "ppt_processing": {
+        "provide_to_ai": false,
+        "moonShot": {
+          "base_url": "https://api.moonshot.cn/v1",
+          "api_key": "",
+          "delete_after_convert": true
+        }
+      },
+      "use_stream": true
+    }
+  }
+}
