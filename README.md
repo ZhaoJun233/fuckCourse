@@ -312,6 +312,3 @@ PyInstaller 打包时自动检测 `sys.frozen`：代码目录指向 `_MEIPASS`�
 
 详见 [LICENSE](LICENSE)。
 
-## 星标趋势
-
-[![Star History Chart](https://api.star-history.com/svg?repos=sheshuyu/fuckCourse&type=Date)](https://star-history.com/#sheshuyu/fuckCourse&Date)
