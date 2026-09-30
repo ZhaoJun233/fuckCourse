@@ -40,12 +40,14 @@ class TestFixesVerified(unittest.TestCase):
 
     def test_02_yuketang_missing_slide_reports_failure(self):
         """[M6] Verify images_to_pdf returns False and logs warning when slide is missing."""
+        import contextlib
         from yuketang.main import images_to_pdf
         with tempfile.TemporaryDirectory() as tmp:
             pdf_path = Path(tmp) / "out.pdf"
             buf = io.BytesIO()
             Image.new("RGB", (10, 10), "white").save(buf, format="PNG")
-            success = images_to_pdf([buf.getvalue(), None], str(pdf_path))
+            with contextlib.redirect_stdout(io.StringIO()):
+                success = images_to_pdf([buf.getvalue(), None], str(pdf_path))
             self.assertFalse(success)
 
     def test_03_chaoxing_course_filter_empty_match_safely_aborts(self):
