@@ -2,6 +2,7 @@
 build/
 dist/
 *.spec
+!fuckCourse.spec
 log.md
 __pycache__/
 *.pyc
@@ -12,6 +13,7 @@ icon/
 config.json
 cookies.json
 logs/
+reviews/
 # 配置（含 Cookie / sessionid，绝对不能提交）
 yuketang_config.py
 yuketang_config.json

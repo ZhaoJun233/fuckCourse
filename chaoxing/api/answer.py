@@ -427,7 +427,8 @@ class TikuYanxi(Tiku):
                 # 'type':q_info['type'], #修复478题目类型与答案类型不符（不想写后处理了）
                 # 没用，就算有type和options，言溪题库还是可能返回类型不符，问了客服，type仅用于收集
             },
-            verify=False
+            verify=True,
+            timeout=30
         )
         if res.status_code == 200:
             res_json = res.json()
@@ -734,7 +735,7 @@ class TikuLike(Tiku):
                 self.query_api,
                 json=request_data,
                 headers=temp_headers,
-                verify=False,
+                verify=True,
                 timeout=self._timeout  # 添加超时设置
             )
         except requests.exceptions.Timeout:
@@ -884,7 +885,7 @@ class TikuLike(Tiku):
             res = requests.get(
                 self.balance_api,
                 headers=temp_headers,
-                verify=False,
+                verify=True,
                 timeout=self._timeout
             )
             if res.status_code == 200:
@@ -974,7 +975,8 @@ class TikuAdapter(Tiku):
                 'options': [sub(r'^[A-Za-z]\.?、?\s?', '', option) for option in options.split('\n')],
                 'type': type
             },
-            verify=False
+            verify=True,
+            timeout=30
         )
         if res.status_code == 200:
             res_json = res.json()
@@ -1119,7 +1121,11 @@ class AI(Tiku):
         self.key = self._conf['key']
         self.model = self._conf['model']
         self.http_proxy = self._conf['http_proxy']
-        self.min_interval_seconds = int(self._conf['min_interval_seconds'])
+        val = self._conf.get('min_interval_seconds') or 0
+        try:
+            self.min_interval_seconds = int(val)
+        except (ValueError, TypeError):
+            self.min_interval_seconds = 0
 
     def check_llm_connection(self) -> bool:
         """
@@ -1243,7 +1249,11 @@ class SiliconFlow(Tiku):
         self.model_name = self._conf.get('siliconflow_model', 'deepseek-ai/DeepSeek-V3')
 
 
-        self.min_interval = int(self._conf.get('min_interval_seconds', 3))
+        raw_interval = self._conf.get('min_interval_seconds') or 3
+        try:
+            self.min_interval = int(raw_interval)
+        except (ValueError, TypeError):
+            self.min_interval = 3
 
     def check_llm_connection(self) -> bool:
         """

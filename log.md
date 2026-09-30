@@ -1,5 +1,25 @@
 # fuckCourse 更新日志
 
+## v3.1.0 (2026-09-30)
+
+### 修复
+- packaging: 新增维护标准 `fuckCourse.spec` 文件，显式收集动态依赖（requests, PIL, openai, concurrent 等），修复打包单文件 EXE 启动报 No module named 崩溃的问题。
+- chaoxing: 修复课程 ID 过滤无匹配时静默退化为全选全刷所有课程的风险，改为安全终止并提示。
+- chaoxing: 修复章节工作线程异常未调用 `task_done()` 导致主调度队列永久挂死的问题。
+- chaoxing: 修复未开放章节 tries 计数被注释导致无限重试死循环的问题。
+- chaoxing: 恢复言溪题库、LIKE知识库等接口的 TLS 证书标准验证，消除安全隐患并补充请求超时。
+- zhs: 修复 Hike 视频到达终点时因时刻比较判断导致的无限请求死循环。
+- zhs: 修复 AI 视频在低倍速下累计时间取整为 0 导致进度不推进的死循环问题；为 AI 答题设置最大重试上限，杜绝无限消耗 API Token。
+- zhs: 考试心跳线程改为 daemon 线程，并增加生命周期退出清理机制，修复异常流程导致进程无法退出的问题。
+- zhs: PPT 处理中对 URL 提取路径进行目录边界安全校验，彻底消除 `../` 目录逃逸漏洞风险。
+- zhs: 修复超长 Prompt 截断切片使用浮点数导致 `TypeError` 的问题；修复 `extra_body` 覆盖控制字段引发的模型与传输模式冲突；规范化 OpenAI API URL 拼接。
+- yuketang: PPT 图片抓取使用独立轻量请求，切断向外部 CDN 跨域泄漏 `sessionid` 与 `csrftoken` 的隐私隐患；补充课件下载缺页检测与告警。
+- welearn: 修复刷时长中途网络异常中断时仍无条件上报为已完成的伪成功缺陷；保护课程模式自定义正确率不被二次覆盖。
+- config: 修复共享 JSON 配置文件在解析损坏时被单平台覆盖抹除非相关数据的问题，增加自动备份机制。
+- runtime: 增加 Python 3.10+ 对 `queue.ShutDown` 与 `typing.Self` 的向后兼容回退；多平台 `logging.basicConfig` 增加 `force=True` 防止日志处理器冲突。
+
+---
+
 ## v3.1.0-dev (2026-06-27)
 
 ### 新增

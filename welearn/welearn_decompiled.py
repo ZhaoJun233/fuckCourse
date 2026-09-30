@@ -19,6 +19,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     encoding="utf-8",
+    force=True,
 )
 
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -101,11 +102,19 @@ def _save_welearn_credentials(username, password):
         return
     root = {}
     if os.path.isfile(CONFIG_FILE):
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            try:
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 root = json.load(f)
-            except json.JSONDecodeError:
-                root = {}
+        except json.JSONDecodeError:
+            try:
+                bak = CONFIG_FILE + ".corrupt.bak"
+                os.replace(CONFIG_FILE, bak)
+                logging.warning("配置文件 %s 格式损坏，已备份至 %s", CONFIG_FILE, bak)
+            except OSError:
+                pass
+            root = {}
+        except OSError:
+            root = {}
     section = root.get("welearn", {})
     section["username"] = username
     section["password"] = password
@@ -388,22 +397,23 @@ def startstudy(learntime, x):
         print('提交失败!!!')
         way1Failed.append(0)
 
-    # 方式2: 100%正确率
-    req = s.post(url, data={
-        'action': 'savescoinfo160928',
-        'cid': cid, 'scoid': scoid, 'uid': uid,
-        'progress': '100', 'crate': '100',
-        'status': 'unknown', 'cstatus': 'completed', 'trycount': '0'
-    }, headers={'Referer': referrer})
+    # 方式2: 100%正确率 (仅在未达到100%或方式1失败时兜底尝试，保护自定义分数)
+    if str(learntime).strip() == '100' or '"ret":0' not in req.text:
+        req = s.post(url, data={
+            'action': 'savescoinfo160928',
+            'cid': cid, 'scoid': scoid, 'uid': uid,
+            'progress': '100', 'crate': '100',
+            'status': 'unknown', 'cstatus': 'completed', 'trycount': '0'
+        }, headers={'Referer': referrer})
 
-    if '"ret":0' in req.text:
-        logging.info('方式2成功: %s', location)
-        print('方式2:成功!!!')
-        way2Succeed.append(0)
-    else:
-        logging.error('方式2失败: %s', location)
-        print('方式2:失败!!!')
-        way2Failed.append(0)
+        if '"ret":0' in req.text:
+            logging.info('方式2成功: %s', location)
+            print('方式2:成功!!!')
+            way2Succeed.append(0)
+        else:
+            logging.error('方式2失败: %s', location)
+            print('方式2:失败!!!')
+            way2Failed.append(0)
 
     print(f'[ 已完成 ]    {location}')
 
@@ -472,6 +482,13 @@ def startstudy_time(task_idx, statuses, target_time, x):
             logging.warning('keepsco 异常: %s', scoid, exc_info=True)
             time.sleep(2)
             break
+
+    # 校验时长是否真正达标，未达标不标记完成
+    if elapsed < target_time:
+        statuses[task_idx]['status'] = '中断'
+        logging.warning('时长未达到目标(%d/%d秒): %s', elapsed, target_time, scoid)
+        way1Failed.append(0)
+        return
 
     # 设置CMI数据
     cmi_data = _build_cmi_data(session_time=str(session_time), total_time=str(total_time))

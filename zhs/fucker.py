@@ -849,6 +849,9 @@ class Fucker:
                 not (int(played_time-prev_time) % interval):
                 ret_time = self.saveStuStudyRecord(course_id,file_id,played_time,prev_time,start_date) # report progress
                 prev_time, played_time = ret_time, ret_time
+                if played_time >= end_time:
+                    progressBar(end_time, end_time, prefix=f"fucking {file_id}", suffix="done", progressbar_view=self.progressbar_view)
+                    break
             progressBar(played_time, end_time, prefix=f"fucking {file_id}", suffix="done", progressbar_view=self.progressbar_view)
         logger.info(f"Fucked video {file_id} of course {course_id}, cost {time.time()-begin_time:.2f}s")
         time.sleep(random()+1) # more human-like
@@ -1148,9 +1151,9 @@ class Fucker:
         played_time = startAt
         # 开始观看
         while played_time < video_length:
-            # 上传视频观看进度
-            played_time = min(
-                int(round(played_time + (self.speed or 1.5) * 2)), video_length)
+            # 上传视频观看进度，确保每轮至少推进 1 秒
+            step = max(1, int(round((self.speed or 1.5) * 2)))
+            played_time = min(played_time + step, video_length)
             try:
                 self.reportAiVideoProcess(
                     courseId, classId, fileId, knowledgeId, played_time, watchUId=watchUId)
@@ -1366,6 +1369,11 @@ class Fucker:
                         tprint(
                             f"{prefix*4}__Mastery score below 30, tried {tried_count} times, giving up")
                         break
+                    if tried_count >= 5:
+                        tprint(prefix*4)
+                        tprint(
+                            f"{prefix*4}__Reached max exam attempts ({tried_count}), stopping current exam")
+                        break
 
                     tried_count += 1
                     if mastery_score is not None and mastery_score > 90:
@@ -1443,6 +1451,7 @@ class ExamCtx:
         self.sheetContent = None
         self.timeUpdateIndex = 0
         self.examStopped = False
+        self._stop_event = threading.Event()
 
         if aiConfig.get("enabled", False) and not aiConfig.get("use_zhidao_ai", False):
             opConf: dict = aiConfig.get("openai", {})
@@ -1591,10 +1600,15 @@ class ExamCtx:
             else:
                 logger.error(f"openExam failed, retried 3 times, giving up...")
                 raise e
-        # 启动定时更新时间的线程
-        threading.Thread(target=self.updateExamCostTime,
-                         args=(10,)).start()
+        # 启动定时更新时间的守护线程
+        t = threading.Thread(target=self.updateExamCostTime, args=(10,))
+        t.daemon = True
+        t.start()
         return True
+
+    def stopHeartbeat(self):
+        self.examStopped = True
+        self._stop_event.set()
 
     def updateExamCostTime(self, heartbeatTime: int = 10):
         url = "https://studentexamtest.zhihuishu.com/gateway/t/v1/exam/user/updateUserUsedTime"
@@ -1605,7 +1619,7 @@ class ExamCtx:
             "heartbeatTime": heartbeatTime
         }
 
-        while not self.examStopped:
+        while not self.examStopped and not self._stop_event.is_set():
             try:
                 ret = self.fucker.zhidaoAiExamQuery(
                     url, data, ok_code=0, key=EXAM_KEY, method="POST")
@@ -1617,7 +1631,7 @@ class ExamCtx:
                     logger.info(
                         f"Exam {self.examTestId} cost time: {self.timeUpdateIndex * heartbeatTime}s")
 
-                time.sleep(heartbeatTime)
+                self._stop_event.wait(heartbeatTime)
 
     def getSheetContent(self, triedTimes: int = 0) -> list:
         if self.sheetContent is not None:
@@ -1719,7 +1733,7 @@ class ExamCtx:
                 raise e
 
         finally:
-            self.examStopped = True
+            self.stopHeartbeat()
 
         return True
 
@@ -1788,6 +1802,12 @@ class ExamCtx:
         return [choice['id'] for choice in selected_choices]
 
     def startFuck(self, referenceMaterials: list = [dict(name="参考资料", url="https://www.zhihuishu.com/course/10]", content=str)]) -> tuple[bool, int, int]:
+        try:
+            return self._startFuckInternal(referenceMaterials)
+        finally:
+            self.stopHeartbeat()
+
+    def _startFuckInternal(self, referenceMaterials: list) -> tuple[bool, int, int]:
         self.referenceMaterials = referenceMaterials
 
         # 加载答案缓存
@@ -1931,7 +1951,10 @@ class Openai:
                 continue
 
     def openaiCompletion(self, prompt: str, aimStart: str = "```answer", aimEnd: str = "```", max_retries: int = 3, retry_delay: float = 1.0) -> str:
-        url = f"{self.baseUrl}/v1/chat/completions"
+        base = self.baseUrl.rstrip('/')
+        if not base.endswith('/v1'):
+            base = f"{base}/v1"
+        url = f"{base}/chat/completions"
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.apiKey}",
@@ -1945,7 +1968,7 @@ class Openai:
         body.update({
             key: value
             for key, value in self.extra.items()
-            if key not in {"courseName", "theme", "knowledgePoint"}
+            if key not in {"courseName", "theme", "knowledgePoint", "messages", "model", "stream"}
         })
 
         for attempt in range(max_retries):
@@ -2092,8 +2115,9 @@ class Openai:
         tokens = self.encoder.encode(prompt)
 
         # 如果大于32ktoken，取后32ktoken
-        if len(tokens) > 27.900 * 1000:
-            tokens = tokens[-27.900 * 1000:]
+        max_tokens = int(27.900 * 1000)
+        if len(tokens) > max_tokens:
+            tokens = tokens[-max_tokens:]
 
             prompt = self.encoder.decode(tokens)
             logger.warning(
@@ -2178,21 +2202,29 @@ class PptToTxt:
 
     def __getFilePath(self, url: str) -> str:
         parsed_url = urlparse(url)
-        file_path = parsed_url.path.lstrip('/')
-        local_path = os.path.join(self.__download_path, file_path)
+        # 仅保留纯文件名，并在缓存目录下安全解析，防止目录遍历逃逸
+        clean_name = os.path.basename(parsed_url.path.rstrip('/'))
+        if not clean_name:
+            clean_name = "cached_presentation.pptx"
+        local_path = os.path.abspath(os.path.join(self.__download_path, clean_name))
+        base_dir = os.path.abspath(self.__download_path)
+        if not (local_path == base_dir or local_path.startswith(base_dir + os.sep)):
+            raise ValueError(f"检测到潜在非法路径逃逸 URL: {url}")
 
         if os.path.exists(local_path):
             logger.info(f"File already exists: {local_path}")
             return local_path
 
-        return self.__downloadFile(url)
+        return self.__downloadFile(url, local_path)
 
-    def __downloadFile(self, url: str) -> str:
-        response = self.__session.get(url, stream=True)
+    def __downloadFile(self, url: str, target_path: str = None) -> str:
+        response = self.__session.get(url, stream=True, timeout=30)
         if response.status_code == 200:
-            parsed_url = urlparse(url)
-            file_path = parsed_url.path.lstrip('/')
-            local_path = os.path.join(self.__download_path, file_path)
+            if not target_path:
+                parsed_url = urlparse(url)
+                clean_name = os.path.basename(parsed_url.path.rstrip('/')) or "cached_presentation.pptx"
+                target_path = os.path.abspath(os.path.join(self.__download_path, clean_name))
+            local_path = target_path
 
             os.makedirs(os.path.dirname(local_path), exist_ok=True)
 

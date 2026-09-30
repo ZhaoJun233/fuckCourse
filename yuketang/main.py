@@ -251,9 +251,10 @@ def get_slides(session: requests.Session, lesson_id: str, presentation_id: str) 
     return [{"index": s["index"], "cover": s["cover"]} for s in slides]
 
 
-def download_image(session: requests.Session, url: str) -> bytes | None:
+def download_image(_session: requests.Session, url: str) -> bytes | None:
     try:
-        resp = session.get(url, timeout=30)
+        # 下载图片使用独立请求，不复用携带敏感 sessionid / csrftoken 的会话
+        resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=30)
         if resp.status_code == 200:
             return resp.content
         print(f"\n  [警告] 图片下载失败 HTTP {resp.status_code}: {url}")
@@ -264,6 +265,10 @@ def download_image(session: requests.Session, url: str) -> bytes | None:
 
 def images_to_pdf(image_bytes_list: list, output_path: str) -> bool:
     pil_images = []
+    failed_count = sum(1 for b in image_bytes_list if not b)
+    if failed_count > 0:
+        print(f"  [警告] 课件下载不完整，共有 {failed_count}/{len(image_bytes_list)} 页缺失")
+        return False
     for img_bytes in image_bytes_list:
         if not img_bytes:
             continue

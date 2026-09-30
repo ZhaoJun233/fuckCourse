@@ -255,28 +255,17 @@ Cookies 存储在 `cookies.json` 的 `"yuketang"` 字段（cookie 字符串）�
 
 ## 打包 exe
 
+仓库内已维护标准化并完整收集动态依赖的 `fuckCourse.spec` 文件，直接执行：
+
 ```bash
+pip install -r requirements.txt
 pip install pyinstaller
 
-pyinstaller --onefile --console -p . --name fuckCourse \
-  --add-data "chaoxing;chaoxing" \
-  --add-data "zhs;zhs" \
-  --add-data "welearn;welearn" \
-  --add-data "yuketang;yuketang" \
-  --add-binary "<conda_env>/Library/bin/ffi.dll;." \
-  --add-binary "<conda_env>/Library/bin/libexpat.dll;." \
-  --add-binary "<conda_env>/Library/bin/sqlite3.dll;." \
-  --add-binary "<conda_env>/Library/bin/liblzma.dll;." \
-  --add-binary "<conda_env>/Library/bin/libmpdec-4.dll;." \
-  --add-binary "<conda_env>/Library/bin/libcrypto-3-x64.dll;." \
-  --add-binary "<conda_env>/Library/bin/libssl-3-x64.dll;." \
-  main.py
+# 使用预设配置一键打包
+pyinstaller --clean -y fuckCourse.spec
 ```
 
-`<conda_env>` 替换为 conda 环境路径。首次 build 后生成 `fuckCourse.spec`，后续 rebuild 只需 `pyinstaller fuckCourse.spec`。
-
-## 联系
-有任何问题欢迎联系 sheshuyu1117@gmail.com
+打包完成后，单文件可执行程序将生成于 `dist/fuckCourse.exe`。
 
 ## 致谢
 

@@ -9,7 +9,12 @@ import time
 import traceback
 from concurrent.futures.thread import ThreadPoolExecutor
 from dataclasses import dataclass
-from queue import PriorityQueue, ShutDown
+from queue import PriorityQueue
+try:
+    from queue import ShutDown
+except ImportError:
+    class ShutDown(Exception):
+        pass
 from typing import Any
 
 from api.answer import Tiku
@@ -124,7 +129,7 @@ CHAOXING_DEFAULTS = {
         "key": "",
         "model": "",
         "http_proxy": "",
-        "min_interval_seconds": "",
+        "min_interval_seconds": "0",
         "siliconflow_endpoint": "https://api.siliconflow.cn/v1/chat/completions",
         "siliconflow_key": "",
         "siliconflow_model": "deepseek-ai/DeepSeek-V3",
@@ -391,7 +396,8 @@ class JobProcessor:
 
         self.task_queue.join()
         time.sleep(0.5)
-        self.task_queue.shutdown()
+        if hasattr(self.task_queue, "shutdown"):
+            self.task_queue.shutdown()
 
 
     @log_error
@@ -403,7 +409,11 @@ class JobProcessor:
                 logger.info("Queue shut down")
                 return
 
-            task.result = process_chapter(self.chaoxing, self.course, task.point, self.speed)
+            try:
+                task.result = process_chapter(self.chaoxing, self.course, task.point, self.speed)
+            except Exception as e:
+                logger.error("处理章节 {} 发生异常: {}", task.point.get("title", ""), e)
+                task.result = ChapterResult.ERROR
 
             match task.result:
                 case ChapterResult.SUCCESS:
@@ -412,7 +422,7 @@ class JobProcessor:
                     logger.debug(f"unfinished task: {self.task_queue.unfinished_tasks}")
 
                 case ChapterResult.NOT_OPEN:
-                    # task.tries += 1
+                    task.tries += 1
                     if self.config["notopen_action"] == "continue":
                         logger.warning("章节未开启: {}, 正在跳过", task.point["title"])
                         self.task_queue.task_done()
@@ -581,9 +591,10 @@ def filter_courses(all_course, course_list):
             course_task.append(course)
             seen_keys.add(key)
     
-    # 如果没有指定课程，则学习所有课程
+    # 如果用户指定了课程但未找到匹配项，安全终止，避免误刷全部课程
     if not course_task:
-        course_task = all_course
+        logger.error("未找到任何与指定ID匹配的课程，请检查课程ID配置或输入。")
+        return []
     
     return course_task
 
@@ -617,6 +628,9 @@ def main():
         
         # 过滤要学习的课程
         course_task = filter_courses(all_course, common_config.get("course_list"))
+        if not course_task:
+            logger.warning("没有可执行的课程任务，程序退出。")
+            return
         
         # 开始学习
         logger.info(f"课程列表过滤完毕, 当前课程任务数量: {len(course_task)}")

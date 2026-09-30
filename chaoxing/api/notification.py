@@ -149,7 +149,7 @@ class ServerChan(NotificationService):
             return
 
         self.url = self._conf['url']
-        logger.info(f"已初始化Server酱通知服务，URL: {self.url}")
+        logger.info("已初始化Server酱通知服务")
 
     def _send(self, message: str) -> None:
         """

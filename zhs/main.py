@@ -251,7 +251,7 @@ def _validate_ai_config(ai_config):
         raise ValueError("AI 配置未找到")
     if not isinstance(ai_config, dict):
         raise ValueError(f"AI 配置不是字典，而是 {type(ai_config)}")
-    if ai_config.get("enabled") and ai_config.get("use_zhidao_ai"):
+    if ai_config.get("enabled") and not ai_config.get("use_zhidao_ai"):
         _validate_openai_config(ai_config.get("openai", {}))
     _validate_ppt_config(ai_config.get("ppt_processing", {}))
 

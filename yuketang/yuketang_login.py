@@ -25,6 +25,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=_handlers,
+    force=True,
 )
 
 
@@ -81,8 +82,17 @@ def _shared_config_path():
 def _read_shared_json(filepath):
     try:
         if filepath and os.path.isfile(filepath):
-            return json.loads(Path(filepath).read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+            text = Path(filepath).read_text(encoding="utf-8").strip()
+            if text:
+                return json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            bak = str(filepath) + ".corrupt.bak"
+            Path(filepath).replace(bak)
+            logging.warning("共享文件 %s 格式损坏，已备份至 %s 并重新初始化", filepath, bak)
+        except OSError:
+            pass
+    except OSError:
         pass
     return {}
 

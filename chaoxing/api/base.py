@@ -10,7 +10,11 @@ import time
 from difflib import SequenceMatcher
 from enum import Enum, IntEnum
 from hashlib import md5
-from typing import Self, Optional, Literal
+from typing import Optional, Literal, Any
+try:
+    from typing import Self
+except ImportError:
+    Self = Any
 
 import requests
 from loguru import logger
@@ -124,11 +128,19 @@ def _save_credentials_to_config(username, password):
         return
     root = {}
     if os.path.isfile(config_path):
-        with open(config_path, "r", encoding="utf-8") as f:
-            try:
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
                 root = json.load(f)
-            except json.JSONDecodeError:
-                root = {}
+        except json.JSONDecodeError:
+            try:
+                bak = config_path + ".corrupt.bak"
+                os.replace(config_path, bak)
+                logger.warning(f"配置文件 {config_path} 格式损坏，已备份至 {bak}")
+            except OSError:
+                pass
+            root = {}
+        except OSError:
+            root = {}
     section = root.get("chaoxing", {})
     if "common" not in section:
         section["common"] = {}
@@ -242,7 +254,7 @@ class Chaoxing:
         if login_with_cookies:
             logger.info("Logging in with cookies")
             SessionManager.update_cookies()
-            logger.debug(f"Logged in with cookies: {SessionManager.get_instance()._session.cookies}")
+            logger.debug("Logged in with cookies (masked for privacy)")
             if not self._validate_cookie_session():
                 logger.warning("Cookie 登录校验失败，尝试使用账号密码重新登录")
                 if self.account and self.account.username and self.account.password:
