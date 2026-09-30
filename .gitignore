@@ -6,6 +6,8 @@ log.md
 __pycache__/
 *.pyc
 fuckcourse.log
+*.log
+*.exe
 icon/
 config.json
 cookies.json

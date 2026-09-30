@@ -1446,12 +1446,16 @@ class ExamCtx:
 
         if aiConfig.get("enabled", False) and not aiConfig.get("use_zhidao_ai", False):
             opConf: dict = aiConfig.get("openai", {})
+            openai_extra = dict(opExtra)
+            extra_body = opConf.get("extra_body")
+            if isinstance(extra_body, dict):
+                openai_extra.update(extra_body)
             self.op = Openai(
                 baseUrl=opConf.get("api_base", "https://api.openai.com/v1"),
                 apiKey=opConf.get("api_key", ""),
                 modelName=opConf.get("model_name", "davinci"),
                 stream=aiConfig.get("use_stream", False),
-                extra=opExtra,
+                extra=openai_extra,
             )
 
         if aiConfig.get("enabled", False) and aiConfig.get("use_zhidao_ai", False):
@@ -1938,6 +1942,11 @@ class Openai:
             "model": self.modelName,
             "stream": self.stream,
         }
+        body.update({
+            key: value
+            for key, value in self.extra.items()
+            if key not in {"courseName", "theme", "knowledgePoint"}
+        })
 
         for attempt in range(max_retries):
             try:
