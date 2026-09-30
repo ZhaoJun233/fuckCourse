@@ -1,4 +1,4 @@
-# fuckCourse v3.1.0-dev
+# fuckCourse v3.1.0
 
 [![CI & Build](https://github.com/ZhaoJun233/fuckCourse/actions/workflows/ci.yml/badge.svg)](https://github.com/ZhaoJun233/fuckCourse/actions/workflows/ci.yml)
 
@@ -76,7 +76,7 @@ python main.py
 
 ```
 ==================================================
-             fuckCourse v3.1.0-dev
+             fuckCourse v3.1.0
              designed by snake
 ==================================================
 

@@ -78,6 +78,8 @@ jobs:
           if (!(Test-Path "dist/fuckCourse.exe")) {
             throw "Executable dist/fuckCourse.exe was not generated!"
           }
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          [Console]::InputEncoding  = [System.Text.Encoding]::UTF8
           "0" | ./dist/fuckCourse.exe
           Write-Host "Smoke test passed successfully."
 

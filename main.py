@@ -1,6 +1,18 @@
-"""fuckCourse v3.1.0-dev — unified launcher for course automation tools."""
+"""fuckCourse v3.1.0 — unified launcher for course automation tools."""
 import os
 import sys
+
+# 保证控制台与打包环境在任意 Windows 区域代码页 (如 cp1252) 下均支持 Unicode 输出
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if sys.stderr and hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 if getattr(sys, 'frozen', False):
     APP_DIR = sys._MEIPASS
@@ -115,7 +127,7 @@ def run_yuketang():
 
 def print_banner():
     print("=" * 50)
-    print("             fuckCourse v3.1.0-dev")
+    print("             fuckCourse v3.1.0")
     print("             designed by snake")
     print("=" * 50)
     print()
