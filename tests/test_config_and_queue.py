@@ -2,7 +2,6 @@
 import ast
 import builtins
 import enum
-import io
 import json
 import os
 import queue
@@ -111,22 +110,25 @@ class TestCredentialWrites(unittest.TestCase):
             with self.subTest(case=case), self.writer(case) as (path, action, _):
                 original = b'{"unrelated": {"keep": true}}'
                 path.write_bytes(original)
-                original_open, original_io_open = builtins.open, io.open
+                original_open, original_path_open = builtins.open, Path.open
+                read_error = PermissionError("Injected configuration read failure")
 
                 def guarded_open(file, mode="r", *args, **kwargs):
                     if os.fspath(file) == str(path) and "r" in mode:
-                        raise PermissionError("Injected configuration read failure")
+                        raise read_error
                     return original_open(file, mode, *args, **kwargs)
 
-                def guarded_io_open(file, mode="r", *args, **kwargs):
+                def guarded_path_open(file, mode="r", *args, **kwargs):
                     if os.fspath(file) == str(path) and "r" in mode:
-                        raise PermissionError("Injected configuration read failure")
-                    return original_io_open(file, mode, *args, **kwargs)
+                        raise read_error
+                    return original_path_open(file, mode, *args, **kwargs)
 
+                # Python 3.10 pathlib caches io.open; patch the public method instead.
                 with patch("builtins.open", side_effect=guarded_open), \
-                        patch("io.open", side_effect=guarded_io_open):
-                    with self.assertRaises(OSError):
+                        patch.object(Path, "open", autospec=True, side_effect=guarded_path_open):
+                    with self.assertRaises(OSError) as raised:
                         action()
+                self.assertIs(raised.exception, read_error)
                 self.assertEqual(path.read_bytes(), original)
                 self.assertEqual(list(path.parent.glob("*.bak")), [])
 
