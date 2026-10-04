@@ -1,7 +1,5 @@
 # fuckCourse v3.1.0
 
-[![CI & Build](https://github.com/ZhaoJun233/fuckCourse/actions/workflows/ci.yml/badge.svg)](https://github.com/ZhaoJun233/fuckCourse/actions/workflows/ci.yml)
-
 超星学习通 / WE Learn / 智慧树 / 雨课堂 四合一自动刷课工具。
 
 ## 项目结构
