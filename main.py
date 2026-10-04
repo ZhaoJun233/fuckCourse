@@ -166,4 +166,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:2] == ["--offline-smoke"]:
+        if len(sys.argv) != 3:
+            raise SystemExit("Usage: fuckCourse --offline-smoke PLATFORM")
+        from smoke_support import smoke_import
+        smoke_import(APP_DIR, sys.argv[2])
+    else:
+        main()

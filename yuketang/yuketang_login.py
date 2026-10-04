@@ -80,24 +80,31 @@ def _shared_config_path():
 
 
 def _read_shared_json(filepath):
+    if not filepath:
+        return {}
     try:
-        if filepath and os.path.isfile(filepath):
-            text = Path(filepath).read_text(encoding="utf-8").strip()
-            if text:
-                return json.loads(text)
+        root = json.loads(Path(filepath).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
     except json.JSONDecodeError:
-        try:
-            bak = str(filepath) + ".corrupt.bak"
-            Path(filepath).replace(bak)
-            logging.warning("共享文件 %s 格式损坏，已备份至 %s 并重新初始化", filepath, bak)
-        except OSError:
-            pass
-    except OSError:
-        pass
-    return {}
+        import tempfile
+        with open(filepath, "rb") as source, tempfile.NamedTemporaryFile(
+            mode="wb", prefix=os.path.basename(filepath) + ".corrupt.",
+            suffix=".bak", dir=os.path.dirname(os.path.abspath(filepath)),
+            delete=False,
+        ) as backup:
+            backup.write(source.read())
+            bak = backup.name
+        logging.warning("共享文件 %s 格式损坏，已备份至 %s 并重新初始化", filepath, bak)
+        return {}
+    if not isinstance(root, dict):
+        raise ValueError("Shared JSON root must be an object")
+    return root
 
 
 def _write_shared_json(filepath, data):
+    if not isinstance(data, dict):
+        raise ValueError("Shared JSON root must be an object")
     Path(filepath).parent.mkdir(parents=True, exist_ok=True)
     Path(filepath).write_text(
         json.dumps(data, indent=2, ensure_ascii=False),

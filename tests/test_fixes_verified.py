@@ -1,149 +1,178 @@
-"""Verification test suite for all applied bug fixes.
-Strictly offline, uses mocks and AST units, no live network or real credentials.
-"""
-import ast
+"""Offline regression checks against real platform definitions."""
+import contextlib
 import io
 import json
+import logging
 import os
-import sys
+import re
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
-from urllib.parse import urlparse
 
 import requests
 from PIL import Image
-
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "yuketang"))
-sys.path.insert(0, str(ROOT / "chaoxing"))
-sys.path.insert(0, str(ROOT / "zhs"))
-sys.path.insert(0, str(ROOT / "welearn"))
+from tests.source_units import load_units
 
 
 class TestFixesVerified(unittest.TestCase):
-    def test_01_yuketang_image_download_is_isolated(self):
-        """[H1] Verify image download doesn't leak session cookies or csrf token."""
-        from yuketang.main import download_image
-        with patch("requests.get") as mock_get:
-            mock_get.return_value = Mock(status_code=200, content=b"image-data")
-            sensitive_session = Mock(cookies={"sessionid": "SECRET"}, headers={"X-CSRFToken": "SECRET"})
-            data = download_image(sensitive_session, "https://cdn.example.com/slide.png")
-            self.assertEqual(data, b"image-data")
-            # Verify requests.get was called directly and session was not touched for requests
-            mock_get.assert_called_once()
-            call_kwargs = mock_get.call_args.kwargs
-            self.assertNotIn("sessionid", str(call_kwargs))
-            self.assertNotIn("X-CSRFToken", str(call_kwargs))
+    def setUp(self):
+        block = patch.object(requests.sessions.Session, "request", side_effect=AssertionError("Network forbidden"))
+        block.start()
+        self.addCleanup(block.stop)
 
-    def test_02_yuketang_missing_slide_reports_failure(self):
-        """[M6] Verify images_to_pdf returns False and logs warning when slide is missing."""
-        import contextlib
-        from yuketang.main import images_to_pdf
+    def pdf_function(self):
+        return load_units("yuketang/main.py", ["images_to_pdf"], {"Image": Image, "io": io, "os": os, "tempfile": tempfile})["images_to_pdf"]
+
+    def image_bytes(self):
+        with Image.new("RGB", (8, 8), "white") as image:
+            buffer = io.BytesIO()
+            image.save(buffer, format="PNG")
+            return buffer.getvalue()
+
+    def test_image_download_is_isolated(self):
+        download = load_units("yuketang/main.py", ["download_image"], {
+            "requests": requests, "USER_AGENT": "review",
+        })["download_image"]
+        session = Mock(cookies={"sessionid": "SYNTHETIC"}, headers={"X-CSRFToken": "SYNTHETIC"})
+        with patch.object(requests, "get", return_value=Mock(status_code=200, content=b"image")) as get:
+            self.assertEqual(download(session, "https://cdn.invalid/image.png"), b"image")
+        get.assert_called_once_with("https://cdn.invalid/image.png", headers={"User-Agent": "review"}, timeout=30)
+        session.get.assert_not_called()
+
+    def test_pdf_missing_corrupt_and_empty_pages_fail_without_output(self):
+        convert = self.pdf_function()
+        good = self.image_bytes()
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+            for index, pages in enumerate(([good, None], [good, b"not-an-image"], [])):
+                with self.subTest(pages=index):
+                    path = Path(tmp) / f"{index}.pdf"
+                    self.assertFalse(convert(pages, str(path)))
+                    self.assertFalse(path.exists())
+
+    def test_pdf_good_pages_are_all_preserved(self):
         with tempfile.TemporaryDirectory() as tmp:
-            pdf_path = Path(tmp) / "out.pdf"
-            buf = io.BytesIO()
-            Image.new("RGB", (10, 10), "white").save(buf, format="PNG")
-            with contextlib.redirect_stdout(io.StringIO()):
-                success = images_to_pdf([buf.getvalue(), None], str(pdf_path))
-            self.assertFalse(success)
+            path = Path(tmp) / "complete.pdf"
+            self.assertTrue(self.pdf_function()([self.image_bytes(), self.image_bytes()], str(path)))
+            self.assertEqual(len(re.findall(rb"/Type /Page\b", path.read_bytes())), 2)
 
-    def test_03_chaoxing_course_filter_empty_match_safely_aborts(self):
-        """[H2] Verify filter_courses returns empty list instead of all courses when ID doesn't match."""
-        from chaoxing.main import filter_courses
-        all_courses = [{"courseId": "101", "clazzId": "A", "title": "Math"}]
-        filtered = filter_courses(all_courses, ["999"])
-        self.assertEqual(filtered, [])
+    def test_pdf_closes_decoded_images_after_failure(self):
+        image = Mock(mode="RGB")
+        fake_image = Mock()
+        fake_image.open.side_effect = [image, ValueError("bad page")]
+        convert = load_units("yuketang/main.py", ["images_to_pdf"], {"Image": fake_image, "io": io})["images_to_pdf"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(convert([b"good", b"bad"], "unused.pdf"))
+        image.close.assert_called_once()
+        image.save.assert_not_called()
 
-    def test_04_chaoxing_not_open_tries_increment(self):
-        """[H4] Verify task.tries increments for NOT_OPEN tasks."""
-        from chaoxing.main import ChapterTask
-        task = ChapterTask(0, {"title": "Test Point"})
-        self.assertEqual(task.tries, 0)
-        task.tries += 1
-        self.assertEqual(task.tries, 1)
+    def test_pdf_save_failure_preserves_existing_file_and_cleans_temp(self):
+        image = Mock(mode="RGB")
+        image.save.side_effect = OSError("Injected save failure")
+        fake_image = Mock()
+        fake_image.open.return_value = image
+        convert = load_units("yuketang/main.py", ["images_to_pdf"], {
+            "Image": fake_image, "io": io, "os": os, "tempfile": tempfile,
+        })["images_to_pdf"]
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+            path = Path(tmp) / "existing.pdf"
+            path.write_bytes(b"ORIGINAL")
+            self.assertFalse(convert([b"image"], str(path)))
+            self.assertEqual(path.read_bytes(), b"ORIGINAL")
+            self.assertEqual([item.name for item in Path(tmp).iterdir()], ["existing.pdf"])
+        image.close.assert_called_once()
 
-    def test_05_zhs_hike_break_at_end_time(self):
-        """[H5] Verify loop exits promptly when played_time reaches end_time."""
-        from zhs.fucker import Fucker
-        f = object.__new__(Fucker)
-        f.end_thre = 1.0
-        f.progressbar_view = False
-        f.saveStuStudyRecord = Mock(return_value=10.0)
-        
-        # Test logic by invoking loop with mocked time and sleep
-        with patch("time.sleep"):
-            # If logic breaks at end_time, saveStuStudyRecord should be called once when already at end
-            total_time = 10.0
-            end_time = 10.0
-            played_time = 10.0
-            prev_time = 10.0
-            start_date = "2026-09-30"
-            interval = 5
-            course_id, file_id = "c1", "f1"
-            
-            # Simulate the loop body from fuckHikeVideo
-            if played_time >= end_time:
-                ret_time = f.saveStuStudyRecord(course_id, file_id, played_time, prev_time, start_date)
-                prev_time, played_time = ret_time, ret_time
-            f.saveStuStudyRecord.assert_called_once_with("c1", "f1", 10.0, 10.0, "2026-09-30")
+    def test_pdf_replace_failure_preserves_existing_file_and_cleans_temp(self):
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+            path = Path(tmp) / "existing.pdf"
+            path.write_bytes(b"ORIGINAL")
+            with patch.object(os, "replace", side_effect=PermissionError("Injected replace failure")):
+                self.assertFalse(self.pdf_function()([self.image_bytes()], str(path)))
+            self.assertEqual(path.read_bytes(), b"ORIGINAL")
+            self.assertEqual([item.name for item in Path(tmp).iterdir()], ["existing.pdf"])
 
-    def test_06_zhs_ai_step_advances_under_low_speed(self):
-        """[H6] Verify step calculation always advances by at least 1 second even with speed=0.1."""
-        speed = 0.1
-        step = max(1, int(round((speed or 1.5) * 2)))
-        self.assertGreaterEqual(step, 1)
+    def test_course_filter_empty_match_safely_aborts(self):
+        function = load_units("chaoxing/main.py", ["filter_courses"], {"logger": Mock()})["filter_courses"]
+        courses = [{"courseId": "101", "clazzId": "A", "title": "Math"}]
+        self.assertEqual(function(courses, ["999"]), [])
 
-    def test_07_zhs_ppt_path_traversal_defense(self):
-        """[H8] Verify path traversal attempts are detected and blocked."""
-        from zhs.fucker import PptToTxt
-        p = object.__new__(PptToTxt)
-        with tempfile.TemporaryDirectory() as tmp:
-            p._PptToTxt__download_path = tmp
-            # Malicious URL with traversal
-            malicious_url = "https://example.com/../../windows/system32/cmd.exe"
-            clean_name = os.path.basename(urlparse(malicious_url).path.rstrip('/'))
-            local_path = os.path.abspath(os.path.join(tmp, clean_name))
-            # Verify clean_name is cmd.exe and confined to tmp
-            self.assertEqual(clean_name, "cmd.exe")
-            self.assertTrue(local_path.startswith(os.path.abspath(tmp)))
+    def score_run(self, responses, score=70):
+        session = Mock(headers={}, cookies={})
+        session.post.side_effect = [Mock(), Mock()] + responses
+        namespace = load_units("welearn/welearn_decompiled.py", ["_build_cmi_data", "startstudy"], {
+            "json": json, "logging": Mock(), "Session": lambda: session, "USER_AGENT": "test",
+            "session": Mock(cookies={}), "uid": "u", "cid": "c", "classid": "cl",
+            "way1Succeed": [], "way1Failed": [], "way2Succeed": [], "way2Failed": [],
+        })
+        with contextlib.redirect_stdout(io.StringIO()):
+            namespace["startstudy"](score, {"id": "lesson"})
+        rates = [call.kwargs["data"]["crate"] for call in session.post.call_args_list if "crate" in call.kwargs["data"]]
+        return rates, namespace
 
-    def test_08_zhs_extra_body_filters_control_keys(self):
-        """[M1] Verify stream, model, messages cannot be overridden by extra_body."""
-        extra = {"stream": False, "model": "fake-model", "temperature": 0.7, "enable_thinking": False}
-        filtered = {
-            key: value
-            for key, value in extra.items()
-            if key not in {"courseName", "theme", "knowledgePoint", "messages", "model", "stream"}
-        }
-        self.assertNotIn("stream", filtered)
-        self.assertNotIn("model", filtered)
-        self.assertIn("temperature", filtered)
-        self.assertIn("enable_thinking", filtered)
+    def test_score_valid_whitespace_json_does_not_retry_or_change_score(self):
+        response = Mock(text='{"ret": 0}')
+        response.json.return_value = json.loads(response.text)
+        rates, state = self.score_run([response])
+        self.assertEqual(rates, ["70"])
+        self.assertEqual(state["way1Succeed"], [0])
 
-    def test_09_zhs_prompt_integer_slice(self):
-        """[M3] Verify token slice index is integer."""
-        max_tokens = int(27.900 * 1000)
-        self.assertIsInstance(max_tokens, int)
-        self.assertEqual(max_tokens, 27900)
-        sample_tokens = list(range(30000))
-        sliced = sample_tokens[-max_tokens:]
-        self.assertEqual(len(sliced), 27900)
+    def test_score_failed_submission_retries_same_custom_score(self):
+        failed = Mock()
+        failed.json.return_value = {"ret": 1}
+        success = Mock()
+        success.json.return_value = {"ret": 0}
+        rates, state = self.score_run([failed, success])
+        self.assertEqual(rates, ["70", "70"])
+        self.assertEqual(state["way2Succeed"], [0])
 
-    def test_10_shared_config_corrupt_backup(self):
-        """[M7] Verify corrupt shared config is safely backed up with .corrupt.bak instead of wiping other sections."""
-        from yuketang.yuketang_login import _read_shared_json
-        with tempfile.TemporaryDirectory() as tmp:
-            broken_file = Path(tmp) / "config.json"
-            broken_file.write_text('{"chaoxing": {"valid": true}, INVALID_JSON...', encoding="utf-8")
-            data = _read_shared_json(str(broken_file))
-            self.assertEqual(data, {})
-            # Verify backup was created
-            bak_file = Path(tmp) / "config.json.corrupt.bak"
-            self.assertTrue(bak_file.exists())
-            self.assertIn("chaoxing", bak_file.read_text(encoding="utf-8"))
+    def test_score_malformed_json_retries_same_score_and_reports_failure(self):
+        malformed = Mock()
+        malformed.json.side_effect = ValueError("bad JSON")
+        rates, state = self.score_run([malformed, malformed])
+        self.assertEqual(rates, ["70", "70"])
+        self.assertEqual(state["way1Succeed"], [])
+        self.assertEqual(state["way2Failed"], [0])
+
+    def test_openai_actual_request_filters_control_keys(self):
+        namespace = load_units("zhs/fucker.py", ["Openai.openaiCompletion"], {
+            "requests": requests, "logger": Mock(), "time": Mock(),
+        })
+        client = namespace["Openai"]()
+        client.baseUrl, client.apiKey, client.modelName, client.stream = "https://model.invalid/v1/", "synthetic", "model", False
+        client.extra = {"stream": True, "model": "wrong", "messages": [], "temperature": .7}
+        response = Mock()
+        response.json.return_value = {"choices": [{"message": {"content": "answer"}}]}
+        with patch.object(requests, "post", return_value=response) as post:
+            self.assertEqual(client.openaiCompletion("prompt"), "answer")
+        call = post.call_args
+        self.assertEqual(call.args[0], "https://model.invalid/v1/chat/completions")
+        self.assertEqual(call.kwargs["json"], {"model": "model", "stream": False, "messages": [{"role": "user", "content": "prompt"}], "temperature": .7})
+
+    def test_actual_ai_video_low_speed_reports_nonzero_progress(self):
+        from types import SimpleNamespace
+        namespace = load_units("zhs/fucker.py", ["Fucker.fuckAiVideo"], {
+            "logger": Mock(), "time": Mock(), "AI_KEY": "synthetic",
+        })
+        client = namespace["Fucker"]()
+        client.speed, client.progressbar_view = .1, False
+        client._checkCookies, client._sessionReady, client.watchVideo = Mock(), Mock(), Mock()
+        client.zhidaoQuery = Mock(return_value=SimpleNamespace(data=[SimpleNamespace(time=4)]))
+        reported = []
+        client.reportAiVideoProcess = lambda *args, **kwargs: reported.append(args[4])
+        client.fuckAiVideo(1, 2, 3, 4)
+        self.assertEqual(reported, [1, 2, 3, 4])
+
+    def test_prompt_actual_generation_truncates_integer_tokens(self):
+        namespace = load_units("zhs/fucker.py", ["Openai.generateAnswer"], {"re": re, "json": json, "logger": Mock()})
+        client = namespace["Openai"]()
+        client.encoder = Mock()
+        client.encoder.encode.return_value = list(range(30000))
+        client.encoder.decode.return_value = "truncated"
+        client.useZhidao = False
+        client.openaiCompletion = Mock(return_value='```answer\n[{"id": "A", "content": "ok"}]\n```')
+        self.assertEqual(client.generateAnswer("long"), ["A"])
+        client.encoder.decode.assert_called_once_with(list(range(2100, 30000)))
+        client.openaiCompletion.assert_called_once_with("truncated")
 
 
 if __name__ == "__main__":

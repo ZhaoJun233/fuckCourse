@@ -72,16 +72,15 @@ jobs:
         run: |
           pyinstaller --clean -y fuckCourse.spec
 
-      - name: Smoke test built executable
+      - name: Audit archive and smoke test all platform imports
         shell: pwsh
+        timeout-minutes: 10
         run: |
-          if (!(Test-Path "dist/fuckCourse.exe")) {
-            throw "Executable dist/fuckCourse.exe was not generated!"
+          python scripts/verify_binary.py dist/fuckCourse.exe --timeout 90
+          if ($LASTEXITCODE -ne 0) {
+            throw "Binary archive audit or offline smoke failed."
           }
-          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-          [Console]::InputEncoding  = [System.Text.Encoding]::UTF8
-          "0" | ./dist/fuckCourse.exe
-          Write-Host "Smoke test passed successfully."
+          Write-Host "Archive audit and all offline import probes passed."
 
       - name: Upload Windows Executable Artifact
         uses: actions/upload-artifact@v4

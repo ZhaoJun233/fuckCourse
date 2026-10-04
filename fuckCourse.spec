@@ -1,5 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
+from pathlib import Path
+import sys
 from PyInstaller.utils.hooks import collect_submodules, collect_data_files
+
+sys.path.insert(0, SPECPATH)
+from build_support import project_datas
 
 block_cipher = None
 
@@ -62,12 +67,7 @@ hidden_imports += collect_submodules('Crypto')
 hidden_imports += collect_submodules('pyaes')
 hidden_imports += collect_submodules('loguru')
 
-datas = [
-    ('chaoxing', 'chaoxing'),
-    ('zhs', 'zhs'),
-    ('welearn', 'welearn'),
-    ('yuketang', 'yuketang'),
-]
+datas = project_datas(Path(SPECPATH))
 
 datas += collect_data_files('tiktoken')
 

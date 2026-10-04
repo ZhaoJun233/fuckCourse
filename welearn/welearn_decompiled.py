@@ -100,21 +100,24 @@ def _get_welearn_config_cached():
 def _save_welearn_credentials(username, password):
     if not CONFIG_FILE:
         return
-    root = {}
-    if os.path.isfile(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                root = json.load(f)
-        except json.JSONDecodeError:
-            try:
-                bak = CONFIG_FILE + ".corrupt.bak"
-                os.replace(CONFIG_FILE, bak)
-                logging.warning("配置文件 %s 格式损坏，已备份至 %s", CONFIG_FILE, bak)
-            except OSError:
-                pass
-            root = {}
-        except OSError:
-            root = {}
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            root = json.load(f)
+    except FileNotFoundError:
+        root = {}
+    except json.JSONDecodeError:
+        import tempfile
+        with open(CONFIG_FILE, "rb") as source, tempfile.NamedTemporaryFile(
+            mode="wb", prefix=os.path.basename(CONFIG_FILE) + ".corrupt.",
+            suffix=".bak", dir=os.path.dirname(os.path.abspath(CONFIG_FILE)),
+            delete=False,
+        ) as backup:
+            backup.write(source.read())
+            bak = backup.name
+        logging.warning("配置文件 %s 格式损坏，已备份至 %s", CONFIG_FILE, bak)
+        root = {}
+    if not isinstance(root, dict):
+        raise ValueError("Configuration root must be a JSON object")
     section = root.get("welearn", {})
     section["username"] = username
     section["password"] = password
@@ -388,7 +391,15 @@ def startstudy(learntime, x):
 
     print(f'>>>>>>>>>>>>>>正确率: {learntime}%')
 
-    if '"ret":0' in req.text:
+    def succeeded(response):
+        try:
+            result = response.json()
+        except ValueError:
+            return False
+        return isinstance(result, dict) and result.get('ret') == 0
+
+    submission_ok = succeeded(req)
+    if submission_ok:
         logging.info('提交成功: %s', location)
         print('提交成功!!!')
         way1Succeed.append(0)
@@ -397,16 +408,17 @@ def startstudy(learntime, x):
         print('提交失败!!!')
         way1Failed.append(0)
 
-    # 方式2: 100%正确率 (仅在未达到100%或方式1失败时兜底尝试，保护自定义分数)
-    if str(learntime).strip() == '100' or '"ret":0' not in req.text:
+    # 失败时仅重试原分数，不覆盖用户选择的正确率。
+    if not submission_ok:
         req = s.post(url, data={
             'action': 'savescoinfo160928',
             'cid': cid, 'scoid': scoid, 'uid': uid,
-            'progress': '100', 'crate': '100',
+            'progress': '100', 'crate': str(learntime),
             'status': 'unknown', 'cstatus': 'completed', 'trycount': '0'
         }, headers={'Referer': referrer})
 
-        if '"ret":0' in req.text:
+        submission_ok = succeeded(req)
+        if submission_ok:
             logging.info('方式2成功: %s', location)
             print('方式2:成功!!!')
             way2Succeed.append(0)
@@ -415,7 +427,7 @@ def startstudy(learntime, x):
             print('方式2:失败!!!')
             way2Failed.append(0)
 
-    print(f'[ 已完成 ]    {location}')
+    print(f'[ {"已完成" if submission_ok else "失败"} ]    {location}')
 
 
 # ============================================================

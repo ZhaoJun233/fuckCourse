@@ -38,3 +38,9 @@ Thumbs.db
 .claude/
 
 fuckCourse.code-workspace
+
+# Local indexes, credential backups and AI download caches
+.codegraph/
+.jspace/
+*.bak
+AiDownloadCache/

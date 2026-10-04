@@ -14,6 +14,7 @@ import os
 import sys
 import time
 import io
+import tempfile
 import logging
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -264,27 +265,37 @@ def download_image(_session: requests.Session, url: str) -> bytes | None:
 
 
 def images_to_pdf(image_bytes_list: list, output_path: str) -> bool:
-    pil_images = []
     failed_count = sum(1 for b in image_bytes_list if not b)
-    if failed_count > 0:
+    if not image_bytes_list or failed_count:
         print(f"  [警告] 课件下载不完整，共有 {failed_count}/{len(image_bytes_list)} 页缺失")
         return False
-    for img_bytes in image_bytes_list:
-        if not img_bytes:
-            continue
-        try:
+
+    pil_images = []
+    temp_path = None
+    try:
+        for img_bytes in image_bytes_list:
             img = Image.open(io.BytesIO(img_bytes))
-            if img.mode != "RGB":
-                img = img.convert("RGB")
             pil_images.append(img)
-        except Exception as e:
-            print(f"  [警告] 图片解码失败: {e}")
-    if not pil_images:
+            img.load()
+            if img.mode != "RGB":
+                converted = img.convert("RGB")
+                pil_images[-1] = converted
+                img.close()
+        # Only replace the destination after every page is decoded and saved.
+        fd, temp_path = tempfile.mkstemp(prefix=".pdf-", suffix=".tmp", dir=os.path.dirname(os.path.abspath(output_path)))
+        os.close(fd)
+        pil_images[0].save(temp_path, save_all=True, append_images=pil_images[1:], format="PDF")
+        os.replace(temp_path, output_path)
+        temp_path = None
+        return True
+    except Exception as e:
+        print(f"  [警告] 课件转换失败: {e}")
         return False
-    pil_images[0].save(
-        output_path, save_all=True, append_images=pil_images[1:], format="PDF"
-    )
-    return True
+    finally:
+        for img in pil_images:
+            img.close()
+        if temp_path is not None:
+            os.unlink(temp_path)
 
 
 def safe_filename(name: str) -> str:

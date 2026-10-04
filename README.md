@@ -50,6 +50,8 @@
 ```
 
 > **关于 JSON 文件**：`config.json` / `cookies.json` 均存放在 exe 同目录（或项目根目录）。frozen 模式下通过环境变量 `FUCKCOURSE_*` 传递路径，子模块优先使用环境变量指向的根目录文件。
+>
+> 超星与 WE Learn 保存账号、雨课堂更新共享配置时，读取失败或 JSON 根不是对象会停止写入。JSON 语法损坏时，先在原目录创建唯一的 `<文件名>.corrupt.<随机标识>.bak`，保存原始字节；仅备份成功后才允许重新初始化。备份失败不会覆盖原文件，已有备份也不会被替换。重新初始化不等于恢复损坏文件中的其他平台字段，需从备份手动恢复；备份可能含凭据，应妥善保管。
 
 
 ## 功能
@@ -257,17 +259,28 @@ Cookies 存储在 `cookies.json` 的 `"yuketang"` 字段（cookie 字符串）�
 
 ## 打包 exe
 
-仓库内已维护标准化并完整收集动态依赖的 `fuckCourse.spec` 文件，直接执行：
+`fuckCourse.spec` 使用 `build_support.py` 中的逐文件源码和必要资源白名单，不递归收集平台目录中的日志、配置、Cookie、备份或缓存。新增平台源码或资源时，需显式更新白名单。
 
 ```bash
 pip install -r requirements.txt
 pip install pyinstaller
-
-# 使用预设配置一键打包
-pyinstaller --clean -y fuckCourse.spec
+python -m PyInstaller --clean -y fuckCourse.spec
 ```
 
-打包完成后，单文件可执行程序将生成于 `dist/fuckCourse.exe`。
+打包完成后，单文件可执行程序生成于 `dist/fuckCourse.exe`。请在分发前执行下列归档审计与离线验证；Git 忽略规则本身不提供打包防泄漏保护。
+
+## 离线验证
+
+```bash
+python -m unittest discover -s tests -p "test_*.py"
+python scripts/verify_binary.py dist/fuckCourse.exe --timeout 90
+```
+
+验证脚本先检查归档白名单、必需源码/字体资源及敏感文件名，再检查菜单退出和四个平台的依赖导入；非零退出、缺失完成标记或超时都会失败。每个平台探针在单独的进程内使用临时配置和日志目录，并禁止 Python 网络解析与连接。
+
+探针只执行平台入口源码中的实际顶层导入声明及必要资源检查，不运行课程菜单、登录、学习、答题提交或模型请求。尤其 ZHS 入口包含顶层交互，不能将直接执行入口当作离线检查。探针通过不代表真实平台业务流程通过。
+
+Hike 保留配置的完成百分比，按整数上报精度向上取整；连续五次回包未产生新进度会失败退出。WE Learn 提交失败只重试原分数。雨课堂任意缺页或坏页都会使本次 PDF 转换失败，不覆盖既有文件。
 
 ## 致谢
 
@@ -282,7 +295,7 @@ v3.0+ 双模式调度：
 - **开发模式**：`subprocess.run()` 启动各平台，透传 stdin/stdout/stderr
 - **frozen 模式**：`exec(compile(...))` 进程内加载模块脚本，避免双进程竞争 stdin
 
-通过环境变量 `FUCKCOURSE_CONFIG`、`FUCKCOURSE_COOKIES`、`FUCKCOURSE_LOG_DIR` 传递根目录路径，各平台直接读写对应 section 和日志。各平台完全独立运行，互不影响。
+通过环境变量 `FUCKCOURSE_CONFIG`、`FUCKCOURSE_COOKIES`、`FUCKCOURSE_LOG_DIR` 传递根目录路径，各平台读写对应 section 和日志。开发模式使用独立子进程；frozen 模式共享解释器，不承诺模块缓存或全局状态完全隔离。
 
 PyInstaller 打包时自动检测 `sys.frozen`：代码目录指向 `_MEIPASS`（解压的模块），用户数据（config/cookies/logs）指向 exe 所在目录。
 

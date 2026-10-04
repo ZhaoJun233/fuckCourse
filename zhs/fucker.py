@@ -23,6 +23,7 @@ import time
 import json
 import re
 import os
+import stat
 from urllib.parse import urlparse
 from urllib.parse import urlencode, parse_qsl, urlsplit, urlunsplit
 from pathlib import Path
@@ -837,10 +838,13 @@ class Fucker:
         start_date = int(time.time()*1000)
         speed = self.speed or 1.25 # default speed for Hike is 1.25
         interval = 30              # interval between 2 progess reports
-        end_time = max(total_time*self.end_thre, 1.0)
+        end_time = max(math.ceil(total_time*self.end_thre), 1)
         played_time = prev_time    # total video played time
+        highest_time = prev_time
+        stalled_reports = 0
         # start main loop
         while played_time <= end_time:
+            self._checkTimeLimit(course_id)
             time.sleep(1)
             ctx.fucked_time += 1
             played_time = min(played_time+speed, end_time)
@@ -848,11 +852,22 @@ class Fucker:
             if played_time >= end_time or \
                 not (int(played_time-prev_time) % interval):
                 ret_time = self.saveStuStudyRecord(course_id,file_id,played_time,prev_time,start_date) # report progress
+                # A rollback/recovery cycle is not new server-confirmed progress.
+                if ret_time > highest_time:
+                    highest_time = ret_time
+                    stalled_reports = 0
+                else:
+                    stalled_reports += 1
+                    if stalled_reports >= 5:
+                        raise RuntimeError(
+                            f"Hike video {file_id} of course {course_id}: no progress "
+                            f"after {stalled_reports} consecutive reports "
+                            f"(server time {ret_time}, target {end_time})")
                 prev_time, played_time = ret_time, ret_time
                 if played_time >= end_time:
                     progressBar(end_time, end_time, prefix=f"fucking {file_id}", suffix="done", progressbar_view=self.progressbar_view)
                     break
-            progressBar(played_time, end_time, prefix=f"fucking {file_id}", suffix="done", progressbar_view=self.progressbar_view)
+            progressBar(played_time, end_time, prefix=f"fucking {file_id}", suffix="", progressbar_view=self.progressbar_view)
         logger.info(f"Fucked video {file_id} of course {course_id}, cost {time.time()-begin_time:.2f}s")
         time.sleep(random()+1) # more human-like
 
@@ -2178,7 +2193,8 @@ class PptToTxt:
     def __initialize_cache(self):
         file_list = self.__client.files.list()
         for file in file_list.data:
-            self.__file_cache[file.filename] = {
+            # Remote filenames and sizes do not attest to content identity.
+            self.__file_cache[f"remote:{file.id}"] = {
                 'id': file.id,
                 'size': file.bytes,
                 'created_at': file.created_at
@@ -2200,34 +2216,58 @@ class PptToTxt:
             logger.error(f"Error processing file from URL {url}: {str(e)}")
             return ""
 
-    def __getFilePath(self, url: str) -> str:
-        parsed_url = urlparse(url)
-        # 仅保留纯文件名，并在缓存目录下安全解析，防止目录遍历逃逸
-        clean_name = os.path.basename(parsed_url.path.rstrip('/'))
-        if not clean_name:
-            clean_name = "cached_presentation.pptx"
-        local_path = os.path.abspath(os.path.join(self.__download_path, clean_name))
-        base_dir = os.path.abspath(self.__download_path)
-        if not (local_path == base_dir or local_path.startswith(base_dir + os.sep)):
-            raise ValueError(f"检测到潜在非法路径逃逸 URL: {url}")
+    def __cachePath(self, url: str) -> str:
+        suffix = Path(urlparse(url).path).suffix.lower()
+        if not re.fullmatch(r"\.[a-z0-9]{1,10}", suffix):
+            suffix = ".pptx"
+        digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
+        return self.__validateCachePath(
+            os.path.join(self.__download_path, f"url-{digest}{suffix}"))
 
+    def __validateCachePath(self, target_path: str) -> str:
+        base_dir = Path(os.path.abspath(self.__download_path))
+        local_path = Path(os.path.abspath(target_path))
+        try:
+            if local_path == base_dir or os.path.commonpath((base_dir, local_path)) != str(base_dir):
+                raise ValueError("Cache path is outside the download directory")
+            # lstat catches dangling links and Windows junctions before resolving.
+            components = [base_dir]
+            for part in local_path.relative_to(base_dir).parts:
+                components.append(components[-1] / part)
+            for component in components:
+                try:
+                    metadata = os.lstat(component)
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISLNK(metadata.st_mode) or (
+                    getattr(metadata, "st_file_attributes", 0) &
+                    getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+                ):
+                    raise ValueError("Cache path contains a symlink or reparse point")
+            resolved_base = base_dir.resolve()
+            resolved_path = local_path.resolve()
+            if resolved_path == resolved_base or os.path.commonpath(
+                (resolved_base, resolved_path)
+            ) != str(resolved_base):
+                raise ValueError("Resolved cache path is outside the download directory")
+        except (OSError, RuntimeError) as exc:
+            raise ValueError("Cannot safely resolve cache path") from exc
+        return str(local_path)
+
+    def __getFilePath(self, url: str) -> str:
+        local_path = self.__cachePath(url)
         if os.path.exists(local_path):
             logger.info(f"File already exists: {local_path}")
             return local_path
-
         return self.__downloadFile(url, local_path)
 
     def __downloadFile(self, url: str, target_path: str = None) -> str:
+        local_path = self.__validateCachePath(target_path) if target_path else self.__cachePath(url)
         response = self.__session.get(url, stream=True, timeout=30)
         if response.status_code == 200:
-            if not target_path:
-                parsed_url = urlparse(url)
-                clean_name = os.path.basename(parsed_url.path.rstrip('/')) or "cached_presentation.pptx"
-                target_path = os.path.abspath(os.path.join(self.__download_path, clean_name))
-            local_path = target_path
-
             os.makedirs(os.path.dirname(local_path), exist_ok=True)
-
+            # Check again after the request and directory creation, before writing.
+            local_path = self.__validateCachePath(local_path)
             with open(local_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     f.write(chunk)
@@ -2238,17 +2278,20 @@ class PptToTxt:
             raise Exception(f"Failed to download file: {response.status_code}")
 
     def __uploadFile(self, filePath: str) -> str:
-        filename = os.path.basename(filePath)
+        filePath = self.__validateCachePath(filePath)
         file_size = os.path.getsize(filePath)
-
-        if filename in self.__file_cache and self.__file_cache[filename]['size'] == file_size:
-            logger.info(
-                f"File {filename} already exists on the server. Using existing file.")
-            return self.__file_cache[filename]['id']
+        digest = hashlib.sha256()
+        with open(filePath, 'rb') as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                digest.update(chunk)
+        content_key = f"sha256:{digest.hexdigest()}"
+        if content_key in self.__file_cache:
+            logger.info("Identical file content already exists on the server. Using existing file.")
+            return self.__file_cache[content_key]['id']
 
         file_object = self.__client.files.create(
             file=Path(filePath), purpose="file-extract")
-        self.__file_cache[filename] = {
+        self.__file_cache[content_key] = {
             'id': file_object.id,
             'size': file_size,
             'created_at': datetime.now().timestamp()

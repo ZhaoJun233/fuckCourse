@@ -380,6 +380,7 @@ class JobProcessor:
         self.retry_queue: PriorityQueue[ChapterTask] = PriorityQueue()
         self.wait_queue: PriorityQueue[ChapterTask] = PriorityQueue()
         self.threads: list[threading.Thread] = []
+        self._stop_task = ChapterTask(-1, {})
         self.worker_num = config["jobs"]
         self.config = config
 
@@ -392,12 +393,17 @@ class JobProcessor:
             self.threads.append(thread)
             thread.start()
 
-        threading.Thread(target=self.retry_thread, daemon=True).start()
+        retry_worker = threading.Thread(target=self.retry_thread, daemon=True)
+        self.threads.append(retry_worker)
+        retry_worker.start()
 
         self.task_queue.join()
-        time.sleep(0.5)
-        if hasattr(self.task_queue, "shutdown"):
-            self.task_queue.shutdown()
+        self.retry_queue.join()
+        for _ in range(self.worker_num):
+            self.task_queue.put(self._stop_task)
+        self.retry_queue.put(self._stop_task)
+        for thread in self.threads:
+            thread.join()
 
 
     @log_error
@@ -407,6 +413,10 @@ class JobProcessor:
                 task = self.task_queue.get()
             except ShutDown:
                 logger.info("Queue shut down")
+                return
+
+            if task is self._stop_task:
+                self.task_queue.task_done()
                 return
 
             try:
@@ -460,11 +470,15 @@ class JobProcessor:
         try:
             while True:
                 task = self.retry_queue.get()
-                self.task_queue.put(task)
-                # task_done is not called when a task failed and needs to be retried so if is reinserted into the queue,
-                # the task num will increase by one and become more than the real task number
-                self.task_queue.task_done()
-                time.sleep(1) # TODO: Replace with a configurable wait time
+                try:
+                    if task is self._stop_task:
+                        return
+                    self.task_queue.put(task)
+                    # Release the previous attempt only after its retry is queued.
+                    self.task_queue.task_done()
+                    time.sleep(1) # TODO: Replace with a configurable wait time
+                finally:
+                    self.retry_queue.task_done()
         except ShutDown:
             pass
 

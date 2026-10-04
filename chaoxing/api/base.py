@@ -126,21 +126,24 @@ def _save_credentials_to_config(username, password):
     config_path = os.environ.get("FUCKCOURSE_CONFIG", "")
     if not config_path:
         return
-    root = {}
-    if os.path.isfile(config_path):
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                root = json.load(f)
-        except json.JSONDecodeError:
-            try:
-                bak = config_path + ".corrupt.bak"
-                os.replace(config_path, bak)
-                logger.warning(f"配置文件 {config_path} 格式损坏，已备份至 {bak}")
-            except OSError:
-                pass
-            root = {}
-        except OSError:
-            root = {}
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            root = json.load(f)
+    except FileNotFoundError:
+        root = {}
+    except json.JSONDecodeError:
+        import tempfile
+        with open(config_path, "rb") as source, tempfile.NamedTemporaryFile(
+            mode="wb", prefix=os.path.basename(config_path) + ".corrupt.",
+            suffix=".bak", dir=os.path.dirname(os.path.abspath(config_path)),
+            delete=False,
+        ) as backup:
+            backup.write(source.read())
+            bak = backup.name
+        logger.warning(f"配置文件 {config_path} 格式损坏，已备份至 {bak}")
+        root = {}
+    if not isinstance(root, dict):
+        raise ValueError("Configuration root must be a JSON object")
     section = root.get("chaoxing", {})
     if "common" not in section:
         section["common"] = {}
