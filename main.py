@@ -113,6 +113,10 @@ def run_chaoxing():
     _run(CHAOXING_DIR, ["main.py"], "chaoxing")
 
 
+def run_chaoxing_exam():
+    _run(CHAOXING_DIR, ["main.py", "--exam"], "chaoxing-exam")
+
+
 def run_zhs():
     _run(ZHS_DIR, ["main.py"], "zhs")
 
@@ -141,9 +145,10 @@ def main():
         print("  [2] WE Learn (SFLEP)")
         print("  [3] 智慧树 (ZHS)")
         print("  [4] 雨课堂 (Yuketang)")
+        print("  [5] 超星独立期末考试")
         print("  [0] 退出")
         print()
-        choice = input("  请选择平台 (0-4): ").strip()
+        choice = input("  请选择功能 (0-5): ").strip()
 
         if choice == "1":
             clear()
@@ -157,6 +162,9 @@ def main():
         elif choice == "4":
             clear()
             run_yuketang()
+        elif choice == "5":
+            clear()
+            run_chaoxing_exam()
         elif choice == "0":
             print("\n再见!")
             break

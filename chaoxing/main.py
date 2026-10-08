@@ -27,6 +27,7 @@ from api.logger import logger
 from api.notification import Notification
 from api.live import Live
 from api.live_process import LiveProcessor
+from api.exam_runner import run_exam_mode
 
 class ChapterResult(enum.Enum):
     SUCCESS=0,
@@ -61,6 +62,8 @@ def parse_args():
     )
 
     parser.add_argument("--use-cookies", action="store_true", help="使用cookies登录")
+    parser.add_argument("--exam", action="store_true", help="独立期末考试：确认开始、逐题暂存、确认交卷")
+    parser.add_argument("--exam-list", action="store_true", help="仅只读列出独立考试，不进入考试")
 
     parser.add_argument(
         "-c", "--config", type=str, default=None, help="使用配置文件运行程序"
@@ -209,6 +212,8 @@ def build_config_from_args(args):
     """从命令行参数构建配置"""
     common_config = {
         "use_cookies": args.use_cookies,
+        "exam_mode": getattr(args, "exam", False) or getattr(args, "exam_list", False),
+        "exam_list_only": getattr(args, "exam_list", False),
         "username": args.username,
         "password": args.password,
         "course_list": [item.strip() for item in args.list.split(",") if item.strip()] if args.list else None,
@@ -227,6 +232,9 @@ def init_config():
     root_config = load_config_from_root()
     if root_config is not None:
         common, tiku, notification = root_config
+        # Exam mode is command-line only; chapter configuration must never start exams.
+        common["exam_mode"] = getattr(args, "exam", False) or getattr(args, "exam_list", False)
+        common["exam_list_only"] = getattr(args, "exam_list", False)
         # 命令行参数覆盖配置文件
         if args.username:
             common["username"] = args.username
@@ -662,6 +670,10 @@ def main():
         
         # 检查当前登录状态
         login_with_retry(chaoxing, login_with_cookies=common_config.get("use_cookies", False))
+        if common_config.get("exam_mode", False):
+            run_exam_mode(chaoxing, common_config.get("course_list"),
+                          list_only=common_config.get("exam_list_only", False))
+            return
         
         # 获取所有的课程列表
         all_course = chaoxing.get_course_list()

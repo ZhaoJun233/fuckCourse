@@ -8,6 +8,7 @@ PLATFORM_SOURCES = (
     "chaoxing/api/cxsecret_font.py", "chaoxing/api/decode.py", "chaoxing/api/exceptions.py",
     "chaoxing/api/font_decoder.py", "chaoxing/api/live.py", "chaoxing/api/live_process.py",
     "chaoxing/api/logger.py", "chaoxing/api/notification.py",
+    "chaoxing/api/exam.py", "chaoxing/api/exam_runner.py",
     "welearn/welearn_decompiled.py",
     "zhs/main.py", "zhs/fucker.py", "zhs/logger.py", "zhs/ObjDict.py",
     "zhs/push.py", "zhs/sign.py", "zhs/utils.py", "zhs/zd_utils.py",

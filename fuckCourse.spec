@@ -33,6 +33,8 @@ hidden_imports = [
     'chaoxing.api.live_process',
     'chaoxing.api.logger',
     'chaoxing.api.notification',
+    'chaoxing.api.exam',
+    'chaoxing.api.exam_runner',
     'welearn.welearn_decompiled',
     'zhs.main',
     'zhs.fucker',
