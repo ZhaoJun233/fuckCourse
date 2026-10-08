@@ -139,14 +139,31 @@ class TestFixesVerified(unittest.TestCase):
         })
         client = namespace["Openai"]()
         client.baseUrl, client.apiKey, client.modelName, client.stream = "https://model.invalid/v1/", "synthetic", "model", False
-        client.extra = {"stream": True, "model": "wrong", "messages": [], "temperature": .7}
+        client.extra = {"stream": True, "model": "wrong", "messages": [], "temperature": .7, "reasoning_effort": "high"}
         response = Mock()
         response.json.return_value = {"choices": [{"message": {"content": "answer"}}]}
         with patch.object(requests, "post", return_value=response) as post:
             self.assertEqual(client.openaiCompletion("prompt"), "answer")
         call = post.call_args
         self.assertEqual(call.args[0], "https://model.invalid/v1/chat/completions")
-        self.assertEqual(call.kwargs["json"], {"model": "model", "stream": False, "messages": [{"role": "user", "content": "prompt"}], "temperature": .7})
+        self.assertEqual(call.kwargs["json"], {"model": "model", "stream": False, "messages": [{"role": "user", "content": "prompt"}], "temperature": .7, "reasoning_effort": "high"})
+
+    def test_chaoxing_reasoning_effort_is_optional_and_preserves_deepseek_workaround(self):
+        namespace = load_units("chaoxing/api/answer.py", ["AI._completion_kwargs", "AI._is_deepseek_v4"])
+        client = namespace["AI"]()
+        client.endpoint, client.model = "https://model.invalid/v1", "gemini-test"
+        for config in (None, {}, {"reasoning_effort": ""}):
+            with self.subTest(config=config):
+                client._conf = config
+                self.assertEqual(client._completion_kwargs(model="gemini-test"), {"model": "gemini-test"})
+        client._conf = {"reasoning_effort": "high"}
+        self.assertEqual(client._completion_kwargs(model="gemini-test"), {"model": "gemini-test", "reasoning_effort": "high"})
+        self.assertEqual(client._conf, {"reasoning_effort": "high"})
+        client.endpoint, client.model = "https://api.deepseek.com", "deepseek-v4-pro"
+        self.assertEqual(client._completion_kwargs(model=client.model), {
+            "model": "deepseek-v4-pro", "reasoning_effort": "high",
+            "extra_body": {"thinking": {"type": "disabled"}},
+        })
 
     def test_actual_ai_video_low_speed_reports_nonzero_progress(self):
         from types import SimpleNamespace

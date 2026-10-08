@@ -1010,6 +1010,9 @@ class AI(Tiku):
         )
 
     def _completion_kwargs(self, **kwargs):
+        reasoning_effort = (self._conf or {}).get('reasoning_effort')
+        if reasoning_effort:
+            kwargs['reasoning_effort'] = reasoning_effort
         if self._is_deepseek_v4():
             # DeepSeek V4 defaults to thinking mode, which can leave message.content empty.
             kwargs['extra_body'] = {'thinking': {'type': 'disabled'}}

@@ -128,6 +128,7 @@ CHAOXING_DEFAULTS = {
         "endpoint": "",
         "key": "",
         "model": "",
+        "reasoning_effort": "",
         "http_proxy": "",
         "min_interval_seconds": "0",
         "siliconflow_endpoint": "https://api.siliconflow.cn/v1/chat/completions",

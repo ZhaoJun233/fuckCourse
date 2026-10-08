@@ -153,6 +153,7 @@ Provider 可选项：
 | `endpoint` | AI | API 地址（如 `https://api.openai.com/v1`） |
 | `key` | AI | API Key |
 | `model` | AI | 模型名（如 `gpt-4o`） |
+| `reasoning_effort` | AI | 推理档位（选填，如 `high`；需模型和 API 支持），留空不发送 |
 | `http_proxy` | AI | HTTP 代理（选填） |
 | `min_interval_seconds` | AI | 请求间隔，默认 `3` |
 | `siliconflow_key` | SiliconFlow | API Key |
@@ -230,6 +231,7 @@ URL 格式：
 | `api_base` | string | `"https://api.openai.com"` | API 地址 |
 | `api_key` | string | `"sk-"` | API Key |
 | `model_name` | string | `"claude-3-5-sonnet-20240620"` | 模型名 |
+| `extra_body` | object | `{}` | 额外请求参数，如 `{"reasoning_effort": "high"}`；需模型和 API 支持 |
 
 **ai.ppt_processing（PPT 提供给 AI 作为参考材料，可选）**
 
