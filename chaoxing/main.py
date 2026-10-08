@@ -9,6 +9,7 @@ import time
 import traceback
 from concurrent.futures.thread import ThreadPoolExecutor
 from dataclasses import dataclass
+from getpass import getpass
 from queue import PriorityQueue
 try:
     from queue import ShutDown
@@ -17,8 +18,10 @@ except ImportError:
         pass
 from typing import Any
 
+from requests import RequestException, Timeout
+
 from api.answer import Tiku
-from api.base import Chaoxing, Account, StudyResult, _save_credentials_to_config
+from api.base import Chaoxing, Account, StudyResult
 from api.exceptions import LoginError, InputFormatError
 from api.logger import logger
 from api.notification import Notification
@@ -257,9 +260,7 @@ def init_chaoxing(common_config, tiku_config):
     cookies_exist = bool(load_cookies())
     if (not username or not password) and not (use_cookies and cookies_exist):
         username = input("请输入你的手机号, 按回车确认\n手机号:")
-        password = input("请输入你的密码, 按回车确认\n密码:")
-        if username and password:
-            _save_credentials_to_config(username, password)
+        password = getpass("请输入你的密码, 按回车确认\n密码:")
 
     account = Account(username, password)
     
@@ -614,6 +615,32 @@ def filter_courses(all_course, course_list):
     return course_task
 
 
+def login_with_retry(chaoxing, login_with_cookies=False):
+    """Allow explicit credential correction; never retry network failures automatically."""
+    while True:
+        try:
+            state = chaoxing.login(login_with_cookies=login_with_cookies)
+        except Timeout as exc:
+            raise LoginError("登录请求超时，请检查网络后重新进入超星。") from exc
+        except RequestException as exc:
+            raise LoginError("登录请求失败，请检查网络或稍后重试。") from exc
+        if state.get("status"):
+            return state
+
+        message = state.get("msg") or "登录失败"
+        logger.error("登录失败: {}", message)
+        retry = input("是否重新输入账号密码？(Y/n): ").strip().lower()
+        if retry not in ("", "y", "yes"):
+            raise LoginError(message)
+        username = input("请输入手机号（回车保留当前账号）: ").strip() or chaoxing.account.username
+        password = getpass("请输入密码: ")
+        if not username or not password:
+            raise LoginError("未输入完整账号密码，已取消登录。")
+        chaoxing.account.username = username
+        chaoxing.account.password = password
+        login_with_cookies = False
+
+
 def main():
     """主程序入口"""
     try:
@@ -634,9 +661,7 @@ def main():
         notification.init_notification()
         
         # 检查当前登录状态
-        _login_state = chaoxing.login(login_with_cookies=common_config.get("use_cookies", False))
-        if not _login_state["status"]:
-            raise LoginError(_login_state["msg"])
+        login_with_retry(chaoxing, login_with_cookies=common_config.get("use_cookies", False))
         
         # 获取所有的课程列表
         all_course = chaoxing.get_course_list()

@@ -10,6 +10,7 @@ import time
 from difflib import SequenceMatcher
 from enum import Enum, IntEnum
 from hashlib import md5
+from getpass import getpass
 from typing import Optional, Literal, Any
 try:
     from typing import Self
@@ -265,9 +266,7 @@ class Chaoxing:
                 # cookies 失效且没有保存凭据，提示用户输入
                 if self.account:
                     self.account.username = input("Cookies已过期，请输入手机号: ")
-                    self.account.password = input("请输入密码: ")
-                    if self.account.username and self.account.password:
-                        _save_credentials_to_config(self.account.username, self.account.password)
+                    self.account.password = getpass("请输入密码: ")
                 if self.account and self.account.username and self.account.password:
                     return self.login(login_with_cookies=False)
                 return {"status": False, "msg": "cookies 已失效，请更新 cookies 或提供账号密码"}
@@ -288,14 +287,17 @@ class Chaoxing:
             "independentId": 0,
         }
         logger.trace("正在尝试登录...")
-        resp = _session.post(_url, headers=gc.HEADERS, data=_data)
-        if resp and resp.json()["status"] == True:
+        resp = _session.post(_url, headers=gc.HEADERS, data=_data, timeout=(5, 15))
+        resp.raise_for_status()
+        result = resp.json()
+        if result.get("status") == True:
             save_cookies(_session)
+            _save_credentials_to_config(self.account.username, self.account.password)
             SessionManager.update_cookies()
             logger.info("登录成功...")
             return {"status": True, "msg": "登录成功"}
         else:
-            return {"status": False, "msg": str(resp.json()["msg2"])}
+            return {"status": False, "msg": str(result.get("msg2") or result.get("msg") or "登录失败")}
 
     def _validate_cookie_session(self) -> bool:
         session = SessionManager.get_instance()._session
