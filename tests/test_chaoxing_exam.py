@@ -89,6 +89,19 @@ class ExamParsingTests(unittest.TestCase):
             with self.subTest(extra=extra), self.assertRaises(exam.ExamError):
                 exam.parse_paper(paper_html() + extra, exam.HOST + exam.QUESTION_PATH)
 
+    def test_cover_reports_exact_prerequisite_instead_of_generic_signature_error(self):
+        html = '<div class="exam_content"><h2 class="textCenter">章节任务点未完成</h2></div>'
+        with self.assertRaisesRegex(exam.ExamError, '章节任务点未完成') as caught:
+            exam.guard_page(exam.BeautifulSoup(html, 'lxml'), html)
+        self.assertNotIn('签名', str(caught.exception))
+
+    def test_other_cover_requirements_have_specific_messages(self):
+        for text in ('考试尚未开始', '诚信考试承诺', '考生签名', '添加签名',
+                     '请使用指定的IP', '只允许在电脑考试客户端'):
+            html = f'<h2 class="textCenter">{text}</h2>'
+            with self.subTest(text=text), self.assertRaisesRegex(exam.ExamError, text):
+                exam.guard_page(exam.BeautifulSoup(html, 'lxml'), html)
+
     def test_monitor_nonce_with_explicit_inactive_status_is_not_active_monitoring(self):
         extra = '<input type="hidden" id="monitorEnc" value="SYNTHETIC_NONCE"><input type="hidden" id="monitorStatus" value="0">'
         value = exam.parse_paper(paper_html() + extra, exam.HOST + exam.QUESTION_PATH)
@@ -365,6 +378,20 @@ class ExamWorkflowTests(unittest.TestCase):
         self.client.list_exams.side_effect = exam.ExamError('无法读取列表')
         runner.run_exam_mode(cx, list_only=True, client=self.client, emit=self.emit)
         self.assertIn('无法读取列表', str(self.emit.call_args_list))
+
+    def test_select_blocked_exam_reports_reason_without_starting(self):
+        cx = Mock(tiku=self.tiku)
+        cx.get_course_list.return_value = [COURSE]
+        self.client.list_exams.return_value = [EXAM]
+        self.client.prepare.side_effect = exam.ExamError('平台提示：章节任务点未完成。未启动考试。')
+        ask = Mock(return_value='1')
+        runner.run_exam_mode(cx, client=self.client, ask=ask, emit=self.emit)
+        self.client.prepare.assert_called_once_with(EXAM)
+        self.client.start.assert_not_called()
+        self.client.save.assert_not_called()
+        self.client.submit.assert_not_called()
+        ask.assert_called_once()
+        self.assertIn('章节任务点未完成', str(self.emit.call_args_list))
 
     def test_platform_entry_routes_exam_not_chapter_workers(self):
         notification = Mock()

@@ -221,6 +221,7 @@ class StudyResult(Enum):
     FORBIDDEN = 1  # 403
     ERROR = 2
     TIMEOUT = 3
+    DEFERRED = 4  # Not yet available; keep pending without immediate retries.
 
     def is_success(self):
         return self == StudyResult.SUCCESS

@@ -34,6 +34,7 @@ class ChapterResult(enum.Enum):
     ERROR=1,
     NOT_OPEN=2,
     PENDING=3
+    DEFERRED=4
 
 
 def log_error(func):
@@ -351,15 +352,9 @@ def process_job(chaoxing: Chaoxing, course: dict, job: dict, job_info: dict, spe
                 course_id=course.get("courseId")
             )
             
-            # 启动直播处理线程
-            thread = threading.Thread(
-                target=LiveProcessor.run_live,
-                args=(live, speed),
-                daemon=True
-            )
-            thread.start()
-            thread.join()  # 等待直播处理完成
-            return StudyResult.SUCCESS
+            # process_job already runs in the chapter executor. Propagate the real
+            # result instead of losing it inside an extra thread and reporting success.
+            return LiveProcessor.run_live(live, speed)
         except Exception as e:
             logger.error(f"处理直播任务时出错: {str(e)}")
             return StudyResult.ERROR
@@ -386,6 +381,7 @@ class JobProcessor:
         self.max_tries = 5
         self.tasks = tasks
         self.failed_tasks: list[ChapterTask] = []
+        self.deferred_tasks: list[ChapterTask] = []
         self.task_queue: PriorityQueue[ChapterTask] = PriorityQueue()
         self.retry_queue: PriorityQueue[ChapterTask] = PriorityQueue()
         self.wait_queue: PriorityQueue[ChapterTask] = PriorityQueue()
@@ -440,6 +436,11 @@ class JobProcessor:
                     logger.debug("Task success: {}", task.point["title"])
                     self.task_queue.task_done()
                     logger.debug(f"unfinished task: {self.task_queue.unfinished_tasks}")
+
+                case ChapterResult.DEFERRED:
+                    self.deferred_tasks.append(task)
+                    logger.info("章节含暂不可处理的直播，保留待办（本轮不重试）: {}", task.point["title"])
+                    self.task_queue.task_done()
 
                 case ChapterResult.NOT_OPEN:
                     task.tries += 1
@@ -526,8 +527,11 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
             job_results.append(result)
     
     for result in job_results:
-        if result.is_failure():
+        if result.is_failure() and result != StudyResult.DEFERRED:
             return ChapterResult.ERROR
+
+    if StudyResult.DEFERRED in job_results:
+        return ChapterResult.DEFERRED
 
     return ChapterResult.SUCCESS
 
@@ -589,6 +593,7 @@ def process_course(chaoxing: Chaoxing, course:dict[str, Any], config: dict):
         tasks.append(task)
     p = JobProcessor(chaoxing, course, tasks, config)
     p.run()
+    return p
 
 def filter_courses(all_course, course_list):
     """过滤要学习的课程"""
@@ -686,11 +691,20 @@ def main():
         
         # 开始学习
         logger.info(f"课程列表过滤完毕, 当前课程任务数量: {len(course_task)}")
+        deferred = failed = 0
         for course in course_task:
-            process_course(chaoxing, course, common_config)
-        
-        logger.info("所有课程学习任务已完成")
-        notification.send("chaoxing : 所有课程学习任务已完成")
+            processor = process_course(chaoxing, course, common_config)
+            deferred += len(processor.deferred_tasks)
+            failed += len(processor.failed_tasks)
+
+        if deferred or failed:
+            message = f"本轮课程处理结束：{deferred} 个章节有直播待办，{failed} 个章节处理失败；未宣称全部完成。"
+            print(message)
+            logger.warning(message)
+        else:
+            message = "所有课程学习任务已完成"
+            logger.info(message)
+        notification.send(f"chaoxing : {message}")
         
     except SystemExit as e:
         if e.code != 0:

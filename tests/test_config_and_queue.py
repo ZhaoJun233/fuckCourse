@@ -287,6 +287,12 @@ class TestJobProcessorLifecycle(unittest.TestCase):
         self.assertEqual(calls, {})
         self.assertEqual(processor.failed_tasks, [])
 
+    def test_deferred_live_is_retained_without_retry_or_false_success(self):
+        processor, calls = self.run_processor(lambda results, _attempt: results.DEFERRED)
+        self.assertEqual(set(calls.values()), {1})
+        self.assertEqual(len(processor.deferred_tasks), 4)
+        self.assertEqual(processor.failed_tasks, [])
+
     def test_error_retries_then_success_reclaims_retry_worker(self):
         processor, calls = self.run_processor(
             lambda results, attempt: results.ERROR if attempt < 3 else results.SUCCESS)

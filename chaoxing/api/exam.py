@@ -83,10 +83,19 @@ def hidden_fields(soup):
 
 def guard_page(soup, html):
     text = soup.get_text(" ", strip=True)
-    if any(word in text for word in ("添加签名", "考生签名", "诚信考试承诺",
-                                    "请使用指定的IP", "只允许在电脑考试客户端",
-                                    "章节任务点未完成", "考试尚未开始")):
-        raise ExamError("考试要求承诺签名、指定环境或前置条件，请本人在官方客户端完成；未绕过。")
+    requirements = (
+        ("章节任务点未完成", "请先按课程要求完成任务点，再在官方客户端确认考试已开放；未启动考试。"),
+        ("考试尚未开始", "请在考试开放时间内使用官方客户端确认；未启动考试。"),
+        ("添加签名", "请本人在官方客户端完成承诺签名；本程序不代签、不绕过。"),
+        ("考生签名", "请本人在官方客户端完成承诺签名；本程序不代签、不绕过。"),
+        ("诚信考试承诺", "请本人在官方客户端完成承诺签名；本程序不代签、不绕过。"),
+        ("请使用指定的IP", "请使用老师指定的网络环境在官方客户端考试；未绕过。"),
+        ("只允许在电脑考试客户端", "请使用指定的官方考试客户端；未绕过。"),
+    )
+    for reason, advice in requirements:
+        if reason in text:
+            # Only fixed, recognized messages; never echo raw signed HTML/URLs.
+            raise ExamError(f"平台提示：{reason}。{advice}")
     fields = hidden_fields(soup)
     for key in ("faceRecognitionCompare", "faceDetection", "needFace", "monitorStatus",
                 "monitorforcesubmit", "captchaCaptchaId", "needCaptcha"):

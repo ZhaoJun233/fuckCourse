@@ -80,6 +80,12 @@ def _run_frozen(cwd, script_args, name):
         sys.argv = old_argv
         os.chdir(old_cwd)
         sys.path[:] = old_path
+    # Keep errors and completion notices visible before main() clears the screen.
+    # The source/subprocess launcher already waits here; frozen builds must too.
+    try:
+        input("按回车返回菜单...")
+    except (EOFError, KeyboardInterrupt):
+        pass
 
 
 def _run_subprocess(cwd, script_args, name):
