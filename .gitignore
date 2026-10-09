@@ -45,3 +45,5 @@ fuckCourse.code-workspace
 *.bak
 AiDownloadCache/
 exam_reviews/
+progress_state.json
+progress_state.json.*.tmp

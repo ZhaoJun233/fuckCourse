@@ -253,6 +253,26 @@ def _extract_job_info(cards_data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def decode_media_completion(html_text: str, job: dict) -> Optional[bool]:
+    """Read the exact media attachment, without writing or treating absence as pass."""
+    for match in re.finditer(r"\bmArg\s*=\s*", html_text):
+        try:
+            data, _ = json.JSONDecoder().raw_decode(html_text[match.end():].lstrip())
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(data, dict) or not isinstance(data.get("attachments"), list):
+            continue
+        matches = [card for card in data["attachments"] if isinstance(card, dict)
+                   and str(card.get("jobid", "")) == str(job.get("jobid", ""))
+                   and str(card.get("objectId", "")) == str(job.get("objectid", ""))
+                   and card.get("type") == "video"]
+        if not job.get("jobid") or not job.get("objectid") or len(matches) != 1:
+            return None
+        passed = matches[0].get("isPassed")
+        return passed if type(passed) is bool else None
+    return None
+
+
 def _process_attachment_cards(cards: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     处理所有附件任务卡片，强化直播任务识别逻辑
@@ -267,7 +287,7 @@ def _process_attachment_cards(cards: List[Dict[str, Any]]) -> List[Dict[str, Any
     
     for index, card in enumerate(cards):
         # 跳过已通过的任务
-        if card.get("isPassed", False):
+        if card.get("isPassed") is True:
             continue
 
         # 处理无job字段的特殊任务

@@ -7,7 +7,6 @@ import sys
 import threading
 import time
 import traceback
-from concurrent.futures.thread import ThreadPoolExecutor
 from dataclasses import dataclass
 from getpass import getpass
 from queue import PriorityQueue
@@ -28,6 +27,7 @@ from api.notification import Notification
 from api.live import Live
 from api.live_process import LiveProcessor
 from api.exam_runner import run_exam_mode
+from api.progress import ProgressStore, ProgressError
 
 class ChapterResult(enum.Enum):
     SUCCESS=0,
@@ -75,10 +75,10 @@ def parse_args():
         "-l", "--list", type=str, default=None, help="要学习的课程ID列表, 以 , 分隔"
     )
     parser.add_argument(
-        "-s", "--speed", type=float, default=1.0, help="视频播放倍速 (默认1, 最大2)"
+        "-s", "--speed", type=float, default=1.0, help="兼容旧参数；保守媒体模式固定1倍真实计时"
     )
     parser.add_argument(
-        "-j", "--jobs", type=int, default=4, help="同时进行的章节数 (默认4, 如果一个章节有多个任务点，不会限制同时处理任务点的数量)"
+        "-j", "--jobs", type=int, default=1, help="兼容旧参数；保守模式固定单章节、单任务"
     )
 
     parser.add_argument(
@@ -109,7 +109,7 @@ CHAOXING_DEFAULTS = {
         "username": "",
         "password": "",
         "speed": 1.0,
-        "jobs": 4,
+        "jobs": 1,
         "notopen_action": "retry",
         "course_list": [],
         "use_cookies": True,
@@ -314,10 +314,6 @@ def process_job(chaoxing: Chaoxing, course: dict, job: dict, job_info: dict, spe
             course, job, job_info, _speed=speed, _type="Video"
         )
         if video_result.is_failure():
-            logger.warning("当前任务非视频任务, 正在尝试音频任务解码")
-            video_result = chaoxing.study_video(
-                course, job, job_info, _speed=speed, _type="Audio")
-        if video_result.is_failure():
             logger.warning(
                 f"出现异常任务 -> 任务章节: {course['title']} 任务ID: {job['jobid']}, 已跳过"
             )
@@ -372,12 +368,9 @@ class ChapterTask:
 
 class JobProcessor:
     def __init__(self, chaoxing: Chaoxing, course: dict[str, Any], tasks: list[ChapterTask], config: dict[str, Any]):
-        if "jobs" not in config or not config["jobs"]:
-            config["jobs"] = 4
-        
         self.chaoxing = chaoxing
         self.course = course
-        self.speed = config["speed"]
+        self.speed = 1.0
         self.max_tries = 5
         self.tasks = tasks
         self.failed_tasks: list[ChapterTask] = []
@@ -386,8 +379,12 @@ class JobProcessor:
         self.retry_queue: PriorityQueue[ChapterTask] = PriorityQueue()
         self.wait_queue: PriorityQueue[ChapterTask] = PriorityQueue()
         self.threads: list[threading.Thread] = []
+        self.verify_completion = None
+        self.progress_error = None
         self._stop_task = ChapterTask(-1, {})
-        self.worker_num = config["jobs"]
+        self.worker_num = 1
+        if config.get("jobs", 1) != 1 or config.get("speed", 1) != 1:
+            logger.warning("启用保守模式：单章节、单任务、1倍真实计时；忽略旧并发与倍速配置。")
         self.config = config
 
     def run(self):
@@ -426,7 +423,17 @@ class JobProcessor:
                 return
 
             try:
-                task.result = process_chapter(self.chaoxing, self.course, task.point, self.speed)
+                if self.progress_error is not None:
+                    task.result = ChapterResult.DEFERRED
+                else:
+                    task.result = process_chapter(self.chaoxing, self.course, task.point, self.speed)
+                    if (task.result == ChapterResult.SUCCESS and self.verify_completion is not None
+                            and self.verify_completion(task.point) is not True):
+                        task.result = ChapterResult.DEFERRED
+            except ProgressError as e:
+                # Drain queues without making further study requests; main reports the halt.
+                self.progress_error = e
+                task.result = ChapterResult.DEFERRED
             except Exception as e:
                 logger.error("处理章节 {} 发生异常: {}", task.point.get("title", ""), e)
                 task.result = ChapterResult.ERROR
@@ -439,13 +446,14 @@ class JobProcessor:
 
                 case ChapterResult.DEFERRED:
                     self.deferred_tasks.append(task)
-                    logger.info("章节含暂不可处理的直播，保留待办（本轮不重试）: {}", task.point["title"])
+                    logger.info("章节含待核查或暂不可处理任务，保留待办（本轮不重试）: {}", task.point["title"])
                     self.task_queue.task_done()
 
                 case ChapterResult.NOT_OPEN:
                     task.tries += 1
                     if self.config["notopen_action"] == "continue":
                         logger.warning("章节未开启: {}, 正在跳过", task.point["title"])
+                        self.failed_tasks.append(task)
                         self.task_queue.task_done()
                         continue
 
@@ -454,6 +462,7 @@ class JobProcessor:
                             "章节未开启: {} 可能由于上一章节的章节检测未完成, 也可能由于该章节因为时效已关闭，"
                             "请手动检查完成并提交再重试。或者在配置中配置(自动跳过关闭章节/开启题库并启用提交)"
                         , task.point["title"])
+                        self.failed_tasks.append(task)
                         self.task_queue.task_done()
                         continue
 
@@ -520,11 +529,13 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
     for job in jobs:
         job["name"] = point["title"]
 
-    # TODO: 个别章节很恶心，多到5个点，可以并行处理，将来会让不同课程不同章节的所有任务点共享一个队列，从而实现全局并行
+    # Serial within the chapter too; a single worker alone does not prevent overlap.
     job_results:list[StudyResult]=[]
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        for result in executor.map(lambda job: process_job(chaoxing, course, job, job_info, speed), jobs):
-            job_results.append(result)
+    for job in jobs:
+        result = process_job(chaoxing, course, job, job_info, 1.0)
+        job_results.append(result)
+        if result.is_failure() and job["type"] == "video":
+            break
     
     for result in job_results:
         if result.is_failure() and result != StudyResult.DEFERRED:
@@ -579,6 +590,8 @@ def process_course(chaoxing: Chaoxing, course:dict[str, Any], config: dict):
     point_list = chaoxing.get_course_point(
         course["courseId"], course["clazzId"], course["cpi"]
     )
+    progress = ProgressStore()
+    progress.check_and_record(chaoxing.get_uid(), course, point_list.get("points"))
 
     # 树形视图
     if config.get("tree_view", True):
@@ -592,7 +605,29 @@ def process_course(chaoxing: Chaoxing, course:dict[str, Any], config: dict):
         task = ChapterTask(point=point, index=i)
         tasks.append(task)
     p = JobProcessor(chaoxing, course, tasks, config)
+
+    def verify_completed_chapter(point):
+        current = chaoxing.get_course_point(course["courseId"], course["clazzId"], course["cpi"])
+        progress.check_and_record(chaoxing.get_uid(), course, current.get("points"))
+        confirmed = any(str(item["id"]) == str(point["id"]) and item["has_finished"]
+                        for item in current["points"])
+        if not confirmed:
+            logger.warning("章节上报与平台完成标记不一致，保留待办，不自动重刷: {}", point["title"])
+        return confirmed
+
+    p.verify_completion = verify_completed_chapter
     p.run()
+    if p.progress_error is not None:
+        raise p.progress_error
+    # Never rely on a finished thread or a write response as course completion.
+    refreshed = chaoxing.get_course_point(course["courseId"], course["clazzId"], course["cpi"])
+    progress.check_and_record(chaoxing.get_uid(), course, refreshed.get("points"))
+    confirmed = {str(point["id"]) for point in refreshed["points"] if point["has_finished"]}
+    for task in tasks:
+        if task.result == ChapterResult.SUCCESS and str(task.point["id"]) not in confirmed:
+            task.result = ChapterResult.ERROR
+            p.failed_tasks.append(task)
+            logger.warning("章节最终回读仍未完成，不标记成功、不自动重刷: {}", task.point["title"])
     return p
 
 def filter_courses(all_course, course_list):
@@ -698,14 +733,18 @@ def main():
             failed += len(processor.failed_tasks)
 
         if deferred or failed:
-            message = f"本轮课程处理结束：{deferred} 个章节有直播待办，{failed} 个章节处理失败；未宣称全部完成。"
+            message = f"本轮课程处理结束：{deferred} 个章节有待办（直播或媒体待核查），{failed} 个章节处理失败；未宣称全部完成。"
             print(message)
             logger.warning(message)
         else:
-            message = "所有课程学习任务已完成"
+            message = "所选课程本次平台回读确认完成（不保证之后不回退）"
             logger.info(message)
         notification.send(f"chaoxing : {message}")
         
+    except ProgressError as e:
+        print(str(e))
+        logger.error(str(e))
+        notification.send(f"chaoxing : {e}")
     except SystemExit as e:
         if e.code != 0:
             logger.error(f"错误: 程序异常退出, 返回码: {e.code}")

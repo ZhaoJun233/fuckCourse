@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import functools
 import json
+import math
 import os
 import random
 import re
@@ -30,6 +31,7 @@ from api.decode import (
     decode_course_list,
     decode_course_point,
     decode_course_card,
+    decode_media_completion,
     decode_course_folder,
     decode_questions_info,
 )
@@ -157,22 +159,26 @@ def _save_credentials_to_config(username, password):
 
 class SessionManager:
     _instance = None
+    _lock = threading.RLock()
 
     def __new__(cls, *args, **kwargs):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+            return cls._instance
 
     def __init__(self):
-        self._session = requests.Session()
-        self._session.mount("https://", HTTPAdapter(max_retries=10))
-        self._session.mount("http://", HTTPAdapter(max_retries=10))
-        self._session.request = functools.partial(self._session.request, timeout=5)
-        # For debug purposes
-        # self._session.verify=False
-        self._session.headers.clear()
-        self._session.headers.update(gc.HEADERS)
-        self._session.cookies.update(use_cookies())
+        with self._lock:
+            if hasattr(self, "_session"):
+                return
+            session = requests.Session()
+            session.mount("https://", HTTPAdapter(max_retries=2))
+            session.mount("http://", HTTPAdapter(max_retries=2))
+            session.request = functools.partial(session.request, timeout=5)
+            session.headers.clear()
+            session.headers.update(gc.HEADERS)
+            session.cookies.update(use_cookies())
+            self._session = session
 
     @classmethod
     def get_instance(cls) -> Self:
@@ -456,8 +462,8 @@ class Chaoxing:
         logger.trace("URL: " + _url)
         logger.trace("开始读取课程所有章节...")
         _resp = _session.get(_url)
-
-        logger.trace(f"原始章节列表内容:\n{_resp.text}")
+        if _resp.status_code != 200:
+            raise ValueError("无法读取平台章节进度，停止处理。")
         logger.info("课程章节读取成功...")
         return decode_course_point(_resp.text)
 
@@ -490,6 +496,8 @@ class Chaoxing:
                 return [], {}
 
             _job_list, _job_info = decode_course_card(_resp.text)
+            for job in _job_list:
+                job["cardnum"] = _possible_num
             if _job_info.get("notOpen", False):
                 # 直接返回, 节省一次请求
                 logger.info("该章节未开放")
@@ -597,8 +605,10 @@ class Chaoxing:
                                "_t": get_timestamp()})
                 resp = _session.get(_url, params=params, headers=headers)
                 if resp.status_code == 200:
-                    logger.trace(resp.text)
-                    return resp.json()["isPassed"], 200
+                    data = resp.json()
+                    if not isinstance(data, dict) or type(data.get("isPassed")) is not bool:
+                        return False, 422
+                    return data["isPassed"], 200
                 # elif resp.ok:
                 #    # TODO: 处理验证码
                 #    pass
@@ -613,8 +623,10 @@ class Chaoxing:
                     break
 
         if resp.status_code == 200:
-            logger.trace(resp.text)
-            return resp.json()["isPassed"], 200
+            data = resp.json()
+            if not isinstance(data, dict) or type(data.get("isPassed")) is not bool:
+                return False, 422
+            return data["isPassed"], 200
 
         elif resp.status_code == 403:
             logger.debug(
@@ -680,94 +692,114 @@ class Chaoxing:
 
         return None
 
+    def confirm_video_completion(self, course: dict, job: dict, job_info: dict) -> Optional[bool]:
+        """Independent, read-only task-card check; never calls get_job_list."""
+        knowledge_id = job_info.get("knowledgeid")
+        if not knowledge_id:
+            return None
+        session = SessionManager.get_session()
+        tabs = [str(job["cardnum"])] if "cardnum" in job else list("0123456")
+        for tab in tabs:
+            self.rate_limiter.limit_rate()
+            try:
+                response = session.get("https://mooc1.chaoxing.com/mooc-ans/knowledge/cards", params={
+                    "clazzid": course["clazzId"], "courseid": course["courseId"],
+                    "knowledgeid": knowledge_id, "ut": "s", "cpi": course["cpi"],
+                    "v": "2025-0424-1038-3", "mooc2": 1, "num": tab}, timeout=8)
+            except RequestException:
+                return None
+            if response.status_code != 200:
+                return None
+            result = decode_media_completion(response.text, job)
+            if result is not None:
+                return result
+        return None
+
     def study_video(self, _course, _job, _job_info, _speed: float = 1.0,
                     _type: Literal["Video", "Audio"] = "Video") -> StudyResult:
-        _session = SessionManager.get_session()
-
-        headers = gc.VIDEO_HEADERS if _type == "Video" else gc.AUDIO_HEADERS
-        _info_url = f"https://mooc1.chaoxing.com/ananas/status/{_job['objectid']}?k={self.get_fid()}&flag=normal"
-        _video_info = _session.get(_info_url, headers=headers).json()
-
-        if _video_info["status"] != "success":
-            logger.error(f"Unknown status: {_video_info['status']}")
+        # Conservative wall-clock timing is not proof of native player viewing.
+        # No instant-end report, forged heartbeat, captcha bypass or auto replay.
+        name = _job.get("name", "媒体任务")
+        try:
+            speed = float(_speed)
+            if not math.isfinite(speed) or speed <= 0:
+                return StudyResult.ERROR
+            if speed != 1:
+                logger.warning("保守模式固定按1倍真实时间处理媒体；忽略配置倍速。")
+            session = SessionManager.get_session()
+            headers = gc.VIDEO_HEADERS if _type == "Video" else gc.AUDIO_HEADERS
+            info_url = f"https://mooc1.chaoxing.com/ananas/status/{_job['objectid']}?k={self.get_fid()}&flag=normal"
+            metadata = session.get(info_url, headers=headers, timeout=8).json()
+            if not isinstance(metadata, dict) or metadata.get("status") != "success":
+                return StudyResult.ERROR
+            token = metadata.get("dtoken")
+            raw_duration = float(metadata.get("duration", 0))
+            raw_bookmark = float(_job.get("playTime", 0))
+            if (not token or not math.isfinite(raw_duration) or raw_duration <= 0
+                    or not raw_duration.is_integer() or not math.isfinite(raw_bookmark)
+                    or raw_bookmark < 0 or raw_bookmark / 1000 > raw_duration):
+                logger.error("媒体时长或历史位置无效，未上报。")
+                return StudyResult.ERROR
+            duration = int(raw_duration)
+            position = raw_bookmark / 1000
+            if position >= duration:
+                if self.confirm_video_completion(_course, _job, _job_info) is True:
+                    return StudyResult.SUCCESS
+                logger.warning("历史位置已到结尾但任务未确认完成，保留待办；请在官方播放器核查，不自动重播。")
+                return StudyResult.DEFERRED
+            try:
+                interval = float(_job_info.get("reportTimeInterval", 60))
+                if not math.isfinite(interval) or not 1 <= interval <= 300:
+                    interval = 60
+            except (ValueError, TypeError, OverflowError):
+                interval = 60
+            logger.info("开始任务: {}, 总时长: {}s, 历史播放位置: {}s（非累计观看证明）",
+                        name, duration, int(position))
+            deadline = time.monotonic() + (duration - position) + interval * 3 + 30
+            end_reports = 0
+            event = 3
+            while True:
+                passed, state = self.video_progress_log(
+                    session, _course, _job, _job_info, token, duration, int(position),
+                    _type, headers=headers, _isdrag=event)
+                # Exclude request and limiter delay from the simulated position.
+                last_tick = last_report = time.monotonic()
+                if passed is True:
+                    for attempt in range(3):
+                        confirmed = self.confirm_video_completion(_course, _job, _job_info)
+                        if confirmed is True:
+                            logger.info("平台任务卡即时复核完成: {}（不保证长期保留）", name)
+                            return StudyResult.SUCCESS
+                        if attempt < 2:
+                            time.sleep(2)
+                    logger.warning("上报结果与独立任务卡不一致，保留待办，不自动重播: {}", name)
+                    return StudyResult.DEFERRED
+                if state != 200:
+                    logger.warning("媒体上报失败（HTTP {}），停止，不切换音频重播: {}", state, name)
+                    return StudyResult.FORBIDDEN if state == 403 else StudyResult.ERROR
+                if position >= duration:
+                    end_reports += 1
+                    if end_reports >= 3:
+                        logger.warning("结尾3次上报仍未确认完成，停止: {}", name)
+                        return StudyResult.TIMEOUT
+                while True:
+                    now = time.monotonic()
+                    if now >= deadline:
+                        logger.warning("媒体任务达到总时间预算，未标记完成: {}", name)
+                        return StudyResult.TIMEOUT
+                    position = min(duration, position + max(0, now - last_tick))
+                    last_tick = now
+                    _draw_progress_bar(position, duration, prefix=name, suffix="本地计时/非平台完成")
+                    # At the end keep native report cadence, never tight-loop full duration.
+                    if now - last_report >= interval or (position >= duration and event != 4):
+                        event = 4 if position >= duration else 0
+                        break
+                    time.sleep(min(1, interval - (now - last_report)))
+        except (RequestException, ValueError, TypeError, OverflowError, KeyError):
+            logger.error("媒体处理失败，未确认完成（请求或数据异常，敏感详情不输出）。")
             return StudyResult.ERROR
-
-        _dtoken = _video_info["dtoken"]
-
-        _crc = _video_info["crc"]
-        _key = _video_info["key"]
-
-        # Time in the real world: last_iter, gc.POLL_INTERVAL
-        # Time in the video (can be scaled with the speed factor): duration, play_time, last_log_time, wait_time
-
-        duration = int(_video_info["duration"])
-        play_time = int(_job["playTime"]) // 1000
-        last_log_time = 0
-        last_iter = time.time()
-        wait_time = int(random.uniform(30, 90))
-
-        logger.info(f"开始任务: {_job['name']}, 总时长: {duration}s, 已进行: {play_time}s")
-
-        forbidden_retry = 0
-        max_forbidden_retry = 2
-
-        passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration, duration,
-                                                _type, headers=headers, _isdrag=4)
-        if passed:
-            logger.info("任务瞬间完成: {}", _job['name'])
-            return StudyResult.SUCCESS
-
-        while not passed:
-            # Sometimes the last request needs to be sent several times to complete the task
-            if play_time - last_log_time >= wait_time or play_time == duration:
-
-                passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration,
-                                                        int(play_time), _type, headers=headers)
-
-                if state == 403:
-                    if forbidden_retry >= max_forbidden_retry:
-                        logger.warning("403重试失败, 跳过当前任务")
-                        return StudyResult.FORBIDDEN
-                    forbidden_retry += 1
-                    logger.warning(
-                        "出现403报错, 正在尝试刷新会话状态 (第{}次)",
-                        forbidden_retry,
-                    )
-                    time.sleep(random.uniform(2, 4))
-                    refreshed_meta = self._recover_after_forbidden(_session, _job, _type)
-                    if refreshed_meta:
-                        # FIXME: if those keys aren't present, it should be considered an error rather than falling back
-                        _dtoken = refreshed_meta.get("dtoken", _dtoken)
-                        _duration = refreshed_meta.get("duration", duration)
-                        play_time = refreshed_meta.get("playTime", play_time)
-
-                        logger.debug("Refreshed token: {}, duration: {}, play time: {}", _dtoken, _duration, play_time)
-                        continue
-
-                elif not passed and state != 200:
-                    return StudyResult.ERROR
-
-                wait_time = int(random.uniform(30, 90))
-                last_log_time = play_time
-
-                logger.trace("Progress logged")
-
-            # Uploading the progress takes time, we assume that the video is still playing in the background, this manually calculates the time elapsed
-            dt = (time.time() - last_iter) * _speed
-            last_iter = time.time()
-            play_time = min(duration, play_time + dt)
-
-            _draw_progress_bar(play_time, duration, prefix=_job["name"], suffix="")
-            if play_time >= duration and not passed:
-                time.sleep(wait_time)
-            else:
-                # 精确计算距下次上报的等待时间，替代原先每秒忙等
-                remaining = (last_log_time + wait_time - play_time) / max(_speed, 0.5)
-                time.sleep(max(0.5, min(remaining, 30)))
-
-        _wipe_bar(_job["name"])
-        logger.info("任务完成: {}", _job['name'])
-        return StudyResult.SUCCESS
+        finally:
+            _wipe_bar(name)
 
     def study_document(self, _course, _job) -> StudyResult:
         """

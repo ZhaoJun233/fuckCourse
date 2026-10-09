@@ -195,7 +195,7 @@ class TestCredentialWrites(unittest.TestCase):
 
 
 class TestJobProcessorLifecycle(unittest.TestCase):
-    def run_processor(self, behavior, *, notopen_action="retry", legacy=True, task_count=4):
+    def run_processor(self, behavior, *, notopen_action="retry", legacy=True, task_count=4, verification=None):
         stop_error = getattr(queue, "ShutDown", type("ShutDown", (Exception,), {}))
         queues, spawned = [], []
         abandon = threading.Event()
@@ -242,12 +242,15 @@ class TestJobProcessorLifecycle(unittest.TestCase):
                                                   current_thread=threading.current_thread),
                      "time": SimpleNamespace(sleep=lambda _seconds: None),
                      "traceback": traceback, "process_chapter": process_chapter}
+        namespace["ProgressError"] = type("ProgressError", (ValueError,), {})
         load_definitions("chaoxing/main.py",
                          {"ChapterResult", "ChapterTask", "log_error", "JobProcessor"}, namespace)
         tasks = [namespace["ChapterTask"](i, {"title": "chapter-" + str(i)})
                  for i in range(task_count)]
         processor = namespace["JobProcessor"](object(), {}, tasks,
                                               {"jobs": 3, "speed": 1, "notopen_action": notopen_action})
+        if verification is not None:
+            processor.verify_completion = lambda point: verification(namespace, point)
         errors = []
 
         def run():
@@ -262,7 +265,9 @@ class TestJobProcessorLifecycle(unittest.TestCase):
             runner.join(timeout=3)
             self.assertFalse(runner.is_alive(), "JobProcessor.run blocked")
             self.assertEqual(errors, [], "JobProcessor.run raised")
-            self.assertEqual(len(spawned), 4, "Expected three task workers plus retry worker")
+            self.assertEqual(processor.worker_num, 1, "Legacy jobs=3 must not re-enable media concurrency")
+            self.assertEqual(processor.speed, 1, "Conservative timing must use real elapsed time")
+            self.assertEqual(len(spawned), 2, "Expected single task worker plus retry worker")
             self.assertTrue(all(not thread.is_alive() for thread in spawned),
                             "Worker or retry thread survived JobProcessor.run")
             self.assertEqual(set(processor.threads), set(spawned), "Retry worker must be tracked")
@@ -292,6 +297,23 @@ class TestJobProcessorLifecycle(unittest.TestCase):
         self.assertEqual(set(calls.values()), {1})
         self.assertEqual(len(processor.deferred_tasks), 4)
         self.assertEqual(processor.failed_tasks, [])
+
+    def test_unconfirmed_chapter_stays_pending_without_automatic_replay(self):
+        processor, calls = self.run_processor(lambda results, _attempt: results.SUCCESS,
+                                              verification=lambda env, point: False)
+        self.assertEqual(set(calls.values()), {1})
+        self.assertEqual(len(processor.deferred_tasks), 4)
+        self.assertEqual(processor.failed_tasks, [])
+
+    def test_checkpoint_regression_stops_all_following_study_requests(self):
+        def regressed(env, point):
+            raise env['ProgressError']('regression')
+
+        processor, calls = self.run_processor(lambda results, _attempt: results.SUCCESS,
+                                              verification=regressed)
+        self.assertEqual(sum(calls.values()), 1)
+        self.assertEqual(len(processor.deferred_tasks), 4)
+        self.assertIsNotNone(processor.progress_error)
 
     def test_error_retries_then_success_reclaims_retry_worker(self):
         processor, calls = self.run_processor(

@@ -250,5 +250,5 @@ class LiveSchedulerTests(unittest.TestCase):
                 with contextlib.redirect_stdout(io.StringIO()):
                     main()
                 message = notification.send.call_args.args[0]
-                self.assertIn(f'{deferred} 个章节有直播待办', message)
+                self.assertIn(f'{deferred} 个章节有待办', message)
                 self.assertNotIn('所有课程学习任务已完成', message)
