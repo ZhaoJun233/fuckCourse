@@ -47,3 +47,5 @@ AiDownloadCache/
 exam_reviews/
 progress_state.json
 progress_state.json.*.tmp
+# Private browser captures can contain signed URLs even after HAR sanitization.
+*.har

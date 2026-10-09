@@ -9,7 +9,7 @@ PLATFORM_SOURCES = (
     "chaoxing/api/font_decoder.py", "chaoxing/api/live.py", "chaoxing/api/live_process.py",
     "chaoxing/api/logger.py", "chaoxing/api/notification.py",
     "chaoxing/api/exam.py", "chaoxing/api/exam_runner.py",
-    "chaoxing/api/progress.py",
+    "chaoxing/api/progress.py", "chaoxing/api/online.py",
     "welearn/welearn_decompiled.py",
     "zhs/main.py", "zhs/fucker.py", "zhs/logger.py", "zhs/ObjDict.py",
     "zhs/push.py", "zhs/sign.py", "zhs/utils.py", "zhs/zd_utils.py",
@@ -51,7 +51,7 @@ def validate_archive_names(names):
         basename = path.name.lower()
         if path.parts and path.parts[0] in PLATFORM_DIRS and name not in expected:
             forbidden.append(name)
-        elif basename in {"config.json", "cookies.json", "yuketang_config.json", "progress_state.json"} or basename.endswith((".log", ".bak")):
+        elif basename in {"config.json", "cookies.json", "yuketang_config.json", "progress_state.json"} or basename.endswith((".log", ".bak", ".har")):
             forbidden.append(name)
     missing = expected - normalized
     if forbidden or missing:

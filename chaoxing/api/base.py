@@ -36,6 +36,8 @@ from api.decode import (
     decode_questions_info,
 )
 from api.exceptions import MaxRetryExceeded
+from api.online import OnlineDetectionError, OnlineMonitor, course_entry_signature
+from api.progress import ProgressError
 
 _progress_lock = threading.Lock()
 _progress_bars = {}  # key -> bar_text, insertion-ordered on CPython 3.7+
@@ -260,6 +262,8 @@ class Chaoxing:
         self.rollback_times = 0
         self.rate_limiter = RateLimiter(0.5)  # 其他接口速率限制比较松
         self.video_log_limiter = RateLimiter(2)  # 上报进度极其容易卡验证码，限制2s一次
+        self._study_contexts = {}  # Server-issued entry signatures: memory only, never logged.
+        self._online_detection_failed = False
 
     def login(self, login_with_cookies=False):
         if login_with_cookies:
@@ -464,6 +468,12 @@ class Chaoxing:
         _resp = _session.get(_url)
         if _resp.status_code != 200:
             raise ValueError("无法读取平台章节进度，停止处理。")
+        context = {'courseId': _courseid, 'clazzId': _clazzid, 'cpi': _cpi}
+        key = tuple(str(context[k]) for k in ('courseId', 'clazzId', 'cpi'))
+        try:
+            self._study_contexts[key] = course_entry_signature(_resp.text, context)
+        except OnlineDetectionError:
+            self._study_contexts[key] = None
         logger.info("课程章节读取成功...")
         return decode_course_point(_resp.text)
 
@@ -715,6 +725,15 @@ class Chaoxing:
                 return result
         return None
 
+    def create_online_monitor(self, course, job_info):
+        """Fresh, official chapter context; no captured keys or guessed login status."""
+        if self._online_detection_failed:
+            raise OnlineDetectionError('在线检测已失败，禁止继续媒体上报。')
+        key = tuple(str(course.get(k, '')) for k in ('courseId', 'clazzId', 'cpi'))
+        return OnlineMonitor.start(SessionManager.get_session(), course,
+                                   job_info.get('knowledgeid'), self._study_contexts.get(key),
+                                   self.get_fid())
+
     def study_video(self, _course, _job, _job_info, _speed: float = 1.0,
                     _type: Literal["Video", "Audio"] = "Video") -> StudyResult:
         # Conservative wall-clock timing is not proof of native player viewing.
@@ -747,6 +766,11 @@ class Chaoxing:
                     return StudyResult.SUCCESS
                 logger.warning("历史位置已到结尾但任务未确认完成，保留待办；请在官方播放器核查，不自动重播。")
                 return StudyResult.DEFERRED
+            monitor = self.create_online_monitor(_course, _job_info)
+            if monitor.enabled:
+                logger.info("官方在线检测已确认；每30秒复查（不等于视频完成或跨天有效）。")
+            else:
+                logger.info("平台明确未启用在线检测；未伪造检测通过。")
             try:
                 interval = float(_job_info.get("reportTimeInterval", 60))
                 if not math.isfinite(interval) or not 1 <= interval <= 300:
@@ -759,14 +783,18 @@ class Chaoxing:
             end_reports = 0
             event = 3
             while True:
+                monitor.check()
                 passed, state = self.video_progress_log(
                     session, _course, _job, _job_info, token, duration, int(position),
                     _type, headers=headers, _isdrag=event)
                 # Exclude request and limiter delay from the simulated position.
                 last_tick = last_report = time.monotonic()
+                monitor.check()
+                last_tick = time.monotonic()
                 if passed is True:
                     for attempt in range(3):
                         confirmed = self.confirm_video_completion(_course, _job, _job_info)
+                        monitor.check()
                         if confirmed is True:
                             logger.info("平台任务卡即时复核完成: {}（不保证长期保留）", name)
                             return StudyResult.SUCCESS
@@ -788,13 +816,18 @@ class Chaoxing:
                         logger.warning("媒体任务达到总时间预算，未标记完成: {}", name)
                         return StudyResult.TIMEOUT
                     position = min(duration, position + max(0, now - last_tick))
-                    last_tick = now
+                    monitor.check()
+                    # Detection network time is not added to media playback position.
+                    now = last_tick = time.monotonic()
                     _draw_progress_bar(position, duration, prefix=name, suffix="本地计时/非平台完成")
                     # At the end keep native report cadence, never tight-loop full duration.
                     if now - last_report >= interval or (position >= duration and event != 4):
                         event = 4 if position >= duration else 0
                         break
                     time.sleep(min(1, interval - (now - last_report)))
+        except OnlineDetectionError:
+            self._online_detection_failed = True
+            raise ProgressError('在线检测未通过或无法确认，已停止本课程后续任务；请在官方播放器核查。') from None
         except (RequestException, ValueError, TypeError, OverflowError, KeyError):
             logger.error("媒体处理失败，未确认完成（请求或数据异常，敏感详情不输出）。")
             return StudyResult.ERROR

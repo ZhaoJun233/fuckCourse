@@ -42,7 +42,7 @@ class PackagingTests(unittest.TestCase):
                 project_datas(tmp)
 
     def test_archive_rejects_secret_and_unlisted_platform_entries(self):
-        for name in ("zhs/logs/debug.log", "chaoxing/cookies.json", "yuketang/config.json", "welearn/private.py", "zhs/cache/data.bin", "config.json.corrupt.bak"):
+        for name in ("zhs/logs/debug.log", "chaoxing/cookies.json", "yuketang/config.json", "welearn/private.py", "zhs/cache/data.bin", "config.json.corrupt.bak", "private.har"):
             with self.subTest(name=name), self.assertRaises(ValueError):
                 validate_archive_names(expected_project_entries() | {name})
 

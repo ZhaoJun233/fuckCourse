@@ -38,33 +38,38 @@ class Clock:
 
 
 class MediaTimingTests(unittest.TestCase):
-    def run_media(self, *, speed=1, bookmark=0, confirmed=True, replies=None):
+    def run_media(self, *, speed=1, bookmark=0, confirmed=True, replies=None,
+                  duration=3, interval=1, monitor_factory=None):
         clock = Clock()
         session = Mock()
         session.get.return_value.json.return_value = {
-            'status': 'success', 'dtoken': 'synthetic', 'duration': 3, 'crc': '', 'key': ''}
+            'status': 'success', 'dtoken': 'synthetic', 'duration': duration, 'crc': '', 'key': ''}
         env = {'SessionManager': SimpleNamespace(get_session=lambda: session),
                'gc': SimpleNamespace(VIDEO_HEADERS={}, AUDIO_HEADERS={}, POLL_INTERVAL=1),
                'time': clock, 'random': SimpleNamespace(uniform=lambda a, b: a),
                'logger': Mock(), 'StudyResult': Result, 'math': math,
                'requests': requests, 'RequestException': requests.RequestException,
-               '_draw_progress_bar': Mock(), '_wipe_bar': Mock()}
+               '_draw_progress_bar': Mock(), '_wipe_bar': Mock(),
+               'OnlineDetectionError': RuntimeError, 'ProgressError': ValueError}
         cx = load_units('chaoxing/api/base.py', ['Chaoxing.study_video'], env)['Chaoxing']()
         cx.get_fid = lambda: 1
         cx.confirm_video_completion = Mock(return_value=confirmed)
         cx._recover_after_forbidden = Mock(return_value=None)
+        cx.create_online_monitor = Mock(return_value=Mock(enabled=True))
+        if monitor_factory is not None:
+            cx.create_online_monitor.side_effect = lambda *args: monitor_factory(clock, cx)
         positions = []
 
         def report(*args, **kwargs):
             positions.append((args[6], clock.now, kwargs.get('_isdrag', 3)))
             if replies is not None:
                 return replies.pop(0) if replies else (False, 200)
-            return args[6] >= 3, 200
+            return args[6] >= duration, 200
 
         cx.video_progress_log = Mock(side_effect=report)
         result = cx.study_video({}, {'objectid': 'synthetic', 'name': 'media',
                                      'jobid': 'job', 'playTime': bookmark},
-                                {'reportTimeInterval': 1}, _speed=speed)
+                                {'reportTimeInterval': interval}, _speed=speed)
         return result, positions, cx, env
 
     def test_new_video_never_reports_full_duration_at_start(self):
@@ -107,6 +112,38 @@ class MediaTimingTests(unittest.TestCase):
                 result, positions, _, _ = self.run_media(speed=speed)
                 self.assertEqual(result, Result.ERROR)
                 self.assertEqual(positions, [])
+
+    def test_initial_online_failure_prevents_first_video_write(self):
+        captured = []
+
+        def factory(clock, cx):
+            captured.append(cx)
+            raise RuntimeError('synthetic online rejection')
+
+        with self.assertRaises(ValueError):
+            self.run_media(monitor_factory=factory)
+        captured[0].video_progress_log.assert_not_called()
+        self.assertTrue(captured[0]._online_detection_failed)
+
+    def test_online_failure_at_thirty_seconds_stops_before_next_progress_report(self):
+        captured = []
+
+        def factory(clock, cx):
+            captured.append(cx)
+            monitor = Mock(enabled=True)
+
+            def check():
+                if clock.now >= 30:
+                    raise RuntimeError('synthetic online rejection')
+
+            monitor.check.side_effect = check
+            return monitor
+
+        with self.assertRaises(ValueError):
+            self.run_media(duration=90, interval=60, monitor_factory=factory)
+        self.assertEqual(captured[0].video_progress_log.call_count, 1)
+        captured[0].confirm_video_completion.assert_not_called()
+        self.assertTrue(captured[0]._online_detection_failed)
 
 
 class SessionReuseTests(unittest.TestCase):
