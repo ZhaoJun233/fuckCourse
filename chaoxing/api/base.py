@@ -555,6 +555,9 @@ class Chaoxing:
             headers = gc.VIDEO_HEADERS
 
         self.video_log_limiter.limit_rate(random_time=True, random_max=2)
+        stop = getattr(self, "_study_stop_event", None)
+        if stop is not None and stop.is_set() is True:
+            return False, 499
 
         if "courseId" in _job["otherinfo"]:
             logger.error(_job["otherinfo"])
@@ -611,6 +614,8 @@ class Chaoxing:
         else:
             logger.warning("Failed to get rt")
             for rt in [0.9, 1]:
+                if stop is not None and stop.is_set() is True:
+                    return False, 499
                 params.update({"rt": rt,
                                "_t": get_timestamp()})
                 resp = _session.get(_url, params=params, headers=headers)
@@ -736,15 +741,16 @@ class Chaoxing:
 
     def study_video(self, _course, _job, _job_info, _speed: float = 1.0,
                     _type: Literal["Video", "Audio"] = "Video") -> StudyResult:
-        # Conservative wall-clock timing is not proof of native player viewing.
+        # Configured local media time is not proof of native player viewing.
         # No instant-end report, forged heartbeat, captcha bypass or auto replay.
         name = _job.get("name", "媒体任务")
+        stop = getattr(self, "_study_stop_event", None)
         try:
             speed = float(_speed)
-            if not math.isfinite(speed) or speed <= 0:
+            if isinstance(_speed, bool) or not math.isfinite(speed) or not 1 <= speed <= 2:
                 return StudyResult.ERROR
-            if speed != 1:
-                logger.warning("保守模式固定按1倍真实时间处理媒体；忽略配置倍速。")
+            if stop is not None and stop.is_set() is True:
+                return StudyResult.DEFERRED
             session = SessionManager.get_session()
             headers = gc.VIDEO_HEADERS if _type == "Video" else gc.AUDIO_HEADERS
             info_url = f"https://mooc1.chaoxing.com/ananas/status/{_job['objectid']}?k={self.get_fid()}&flag=normal"
@@ -777,13 +783,17 @@ class Chaoxing:
                     interval = 60
             except (ValueError, TypeError, OverflowError):
                 interval = 60
-            logger.info("开始任务: {}, 总时长: {}s, 历史播放位置: {}s（非累计观看证明）",
-                        name, duration, int(position))
-            deadline = time.monotonic() + (duration - position) + interval * 3 + 30
+            logger.info("开始任务: {}, 总时长: {}s, 历史播放位置: {}s，本地计时{}倍（非累计观看证明）",
+                        name, duration, int(position), speed)
+            deadline = time.monotonic() + (duration - position) / speed + interval * 3 + 30
             end_reports = 0
             event = 3
             while True:
+                if stop is not None and stop.is_set() is True:
+                    return StudyResult.DEFERRED
                 monitor.check()
+                if stop is not None and stop.is_set() is True:
+                    return StudyResult.DEFERRED
                 passed, state = self.video_progress_log(
                     session, _course, _job, _job_info, token, duration, int(position),
                     _type, headers=headers, _isdrag=event)
@@ -793,6 +803,8 @@ class Chaoxing:
                 last_tick = time.monotonic()
                 if passed is True:
                     for attempt in range(3):
+                        if stop is not None and stop.is_set() is True:
+                            return StudyResult.DEFERRED
                         confirmed = self.confirm_video_completion(_course, _job, _job_info)
                         monitor.check()
                         if confirmed is True:
@@ -811,15 +823,17 @@ class Chaoxing:
                         logger.warning("结尾3次上报仍未确认完成，停止: {}", name)
                         return StudyResult.TIMEOUT
                 while True:
+                    if stop is not None and stop.is_set() is True:
+                        return StudyResult.DEFERRED
                     now = time.monotonic()
                     if now >= deadline:
                         logger.warning("媒体任务达到总时间预算，未标记完成: {}", name)
                         return StudyResult.TIMEOUT
-                    position = min(duration, position + max(0, now - last_tick))
+                    position = min(duration, position + max(0, now - last_tick) * speed)
                     monitor.check()
                     # Detection network time is not added to media playback position.
                     now = last_tick = time.monotonic()
-                    _draw_progress_bar(position, duration, prefix=name, suffix="本地计时/非平台完成")
+                    _draw_progress_bar(position, duration, prefix=name, suffix=f"本地计时 {speed:g}倍/非平台完成")
                     # At the end keep native report cadence, never tight-loop full duration.
                     if now - last_report >= interval or (position >= duration and event != 4):
                         event = 4 if position >= duration else 0
@@ -827,6 +841,8 @@ class Chaoxing:
                     time.sleep(min(1, interval - (now - last_report)))
         except OnlineDetectionError:
             self._online_detection_failed = True
+            if stop is not None:
+                stop.set()
             raise ProgressError('在线检测未通过或无法确认，已停止本课程后续任务；请在官方播放器核查。') from None
         except (RequestException, ValueError, TypeError, OverflowError, KeyError):
             logger.error("媒体处理失败，未确认完成（请求或数据异常，敏感详情不输出）。")

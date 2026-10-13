@@ -3,6 +3,7 @@ import ast
 import builtins
 import enum
 import json
+import math
 import os
 import queue
 import sys
@@ -195,7 +196,7 @@ class TestCredentialWrites(unittest.TestCase):
 
 
 class TestJobProcessorLifecycle(unittest.TestCase):
-    def run_processor(self, behavior, *, notopen_action="retry", legacy=True, task_count=4, verification=None):
+    def run_processor(self, behavior, *, notopen_action="retry", legacy=True, task_count=4, verification=None, jobs=1):
         stop_error = getattr(queue, "ShutDown", type("ShutDown", (Exception,), {}))
         queues, spawned = [], []
         abandon = threading.Event()
@@ -235,20 +236,21 @@ class TestJobProcessorLifecycle(unittest.TestCase):
                 calls[point["title"]] = attempt
             return behavior(namespace["ChapterResult"], attempt)
 
-        namespace = {"dataclass": dataclass, "enum": enum, "Any": Any,
+        namespace = {"dataclass": dataclass, "enum": enum, "Any": Any, "math": math,
                      "Chaoxing": object, "PriorityQueue": create_queue,
                      "ShutDown": stop_error, "logger": Mock(), "sys": sys,
                      "threading": SimpleNamespace(Thread=create_thread,
+                                                  Event=threading.Event, Lock=threading.Lock,
                                                   current_thread=threading.current_thread),
                      "time": SimpleNamespace(sleep=lambda _seconds: None),
                      "traceback": traceback, "process_chapter": process_chapter}
         namespace["ProgressError"] = type("ProgressError", (ValueError,), {})
         load_definitions("chaoxing/main.py",
-                         {"ChapterResult", "ChapterTask", "log_error", "JobProcessor"}, namespace)
+                         {"ChapterResult", "ChapterTask", "log_error", "validate_study_settings", "JobProcessor"}, namespace)
         tasks = [namespace["ChapterTask"](i, {"title": "chapter-" + str(i)})
                  for i in range(task_count)]
-        processor = namespace["JobProcessor"](object(), {}, tasks,
-                                              {"jobs": 3, "speed": 1, "notopen_action": notopen_action})
+        processor = namespace["JobProcessor"](SimpleNamespace(), {}, tasks,
+                                              {"jobs": jobs, "speed": 1, "notopen_action": notopen_action})
         if verification is not None:
             processor.verify_completion = lambda point: verification(namespace, point)
         errors = []
@@ -265,9 +267,9 @@ class TestJobProcessorLifecycle(unittest.TestCase):
             runner.join(timeout=3)
             self.assertFalse(runner.is_alive(), "JobProcessor.run blocked")
             self.assertEqual(errors, [], "JobProcessor.run raised")
-            self.assertEqual(processor.worker_num, 1, "Legacy jobs=3 must not re-enable media concurrency")
+            self.assertEqual(processor.worker_num, jobs, "Configured chapter concurrency must be honored")
             self.assertEqual(processor.speed, 1, "Conservative timing must use real elapsed time")
-            self.assertEqual(len(spawned), 2, "Expected single task worker plus retry worker")
+            self.assertEqual(len(spawned), jobs + 1, "Expected configured task workers plus retry worker")
             self.assertTrue(all(not thread.is_alive() for thread in spawned),
                             "Worker or retry thread survived JobProcessor.run")
             self.assertEqual(set(processor.threads), set(spawned), "Retry worker must be tracked")
@@ -285,6 +287,12 @@ class TestJobProcessorLifecycle(unittest.TestCase):
     def test_success_reclaims_workers_without_queue_shutdown(self):
         processor, calls = self.run_processor(lambda results, _attempt: results.SUCCESS)
         self.assertEqual(set(calls.values()), {1})
+        self.assertEqual(processor.failed_tasks, [])
+
+    def test_four_workers_retry_without_leaking_threads_or_queue_counts(self):
+        processor, calls = self.run_processor(
+            lambda results, attempt: results.ERROR if attempt < 3 else results.SUCCESS, jobs=4)
+        self.assertEqual(set(calls.values()), {3})
         self.assertEqual(processor.failed_tasks, [])
 
     def test_empty_queue_reclaims_all_workers(self):

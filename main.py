@@ -116,7 +116,7 @@ def _run_subprocess(cwd, script_args, name):
 
 
 def run_chaoxing():
-    _run(CHAOXING_DIR, ["main.py"], "chaoxing")
+    _run(CHAOXING_DIR, ["main.py", "--study-settings"], "chaoxing")
 
 
 def run_chaoxing_exam():

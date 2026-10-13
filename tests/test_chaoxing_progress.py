@@ -39,7 +39,7 @@ class Clock:
 
 class MediaTimingTests(unittest.TestCase):
     def run_media(self, *, speed=1, bookmark=0, confirmed=True, replies=None,
-                  duration=3, interval=1, monitor_factory=None):
+                  duration=3, interval=1, monitor_factory=None, stop_event=None):
         clock = Clock()
         session = Mock()
         session.get.return_value.json.return_value = {
@@ -53,6 +53,7 @@ class MediaTimingTests(unittest.TestCase):
                'OnlineDetectionError': RuntimeError, 'ProgressError': ValueError}
         cx = load_units('chaoxing/api/base.py', ['Chaoxing.study_video'], env)['Chaoxing']()
         cx.get_fid = lambda: 1
+        cx._study_stop_event = stop_event
         cx.confirm_video_completion = Mock(return_value=confirmed)
         cx._recover_after_forbidden = Mock(return_value=None)
         cx.create_online_monitor = Mock(return_value=Mock(enabled=True))
@@ -78,9 +79,39 @@ class MediaTimingTests(unittest.TestCase):
         self.assertTrue(all(position <= elapsed for position, elapsed, _ in positions))
         self.assertEqual(result, Result.SUCCESS)
 
-    def test_configured_speed_does_not_fabricate_elapsed_time(self):
-        _, positions, _, _ = self.run_media(speed=2)
-        self.assertTrue(all(position <= elapsed for position, elapsed, _ in positions))
+    def test_configured_speed_scales_only_media_time_not_report_cadence(self):
+        result, positions, _, _ = self.run_media(speed=2, duration=8, interval=2)
+        self.assertEqual(result, Result.SUCCESS)
+        self.assertEqual(positions, [(0, 0, 3), (4, 2, 0), (8, 4, 4)])
+
+    def test_online_detection_keeps_wall_clock_cadence_at_double_speed(self):
+        checks = []
+        def monitor_factory(clock, cx):
+            class Monitor:
+                enabled = True
+                next_check = 30
+                def check(self):
+                    if clock.now >= self.next_check:
+                        checks.append(clock.now)
+                        self.next_check += 30
+            return Monitor()
+        result, positions, _, _ = self.run_media(speed=2, duration=120, interval=60,
+                                               monitor_factory=monitor_factory)
+        self.assertEqual(result, Result.SUCCESS)
+        self.assertEqual(checks, [30, 60])
+        self.assertEqual(positions, [(0, 0, 3), (120, 60, 4)])
+
+    def test_shared_stop_signal_prevents_next_media_write(self):
+        stop = threading.Event()
+        def monitor_factory(clock, cx):
+            class Monitor:
+                enabled = True
+                def check(self):
+                    stop.set()
+            return Monitor()
+        result, positions, _, _ = self.run_media(stop_event=stop, monitor_factory=monitor_factory)
+        self.assertEqual(result, Result.DEFERRED)
+        self.assertEqual(positions, [])
 
     def test_http_pass_requires_independent_task_card_confirmation(self):
         result, _, cx, _ = self.run_media(confirmed=False)
@@ -312,7 +343,7 @@ class CourseRecheckTests(unittest.TestCase):
                     task.result = result.SUCCESS
 
         env = {'logger': Mock(), 'ProgressStore': lambda: store, 'JobProcessor': Processor,
-               'ChapterResult': result,
+               'ChapterResult': result, 'threading': threading,
                'ChapterTask': lambda point, index: SimpleNamespace(point=point, index=index),
                'print_course_tree': Mock()}
         run = load_units('chaoxing/main.py', ['process_course'], env)['process_course']

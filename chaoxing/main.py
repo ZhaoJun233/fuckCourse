@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import argparse
 import json
+import math
 import os
 import enum
 import sys
@@ -65,6 +66,7 @@ def parse_args():
     parser.add_argument("--use-cookies", action="store_true", help="使用cookies登录")
     parser.add_argument("--exam", action="store_true", help="独立期末考试：确认开始、逐题暂存、确认交卷")
     parser.add_argument("--exam-list", action="store_true", help="仅只读列出独立考试，不进入考试")
+    parser.add_argument("--study-settings", action="store_true", help="开始刷课前交互设置小节并发数和媒体倍速")
 
     parser.add_argument(
         "-c", "--config", type=str, default=None, help="使用配置文件运行程序"
@@ -75,10 +77,10 @@ def parse_args():
         "-l", "--list", type=str, default=None, help="要学习的课程ID列表, 以 , 分隔"
     )
     parser.add_argument(
-        "-s", "--speed", type=float, default=1.0, help="兼容旧参数；保守媒体模式固定1倍真实计时"
+        "-s", "--speed", type=float, default=None, help="媒体本地计时倍速（1–2）；未指定则使用配置，不保证平台认可"
     )
     parser.add_argument(
-        "-j", "--jobs", type=int, default=1, help="兼容旧参数；保守模式固定单章节、单任务"
+        "-j", "--jobs", type=int, default=None, help="同时处理的未完成小节数（1–16）；小节内任务仍串行"
     )
 
     parser.add_argument(
@@ -195,10 +197,6 @@ def load_config_from_root():
     tiku = section.get("tiku", {})
     notification = section.get("notification", {})
 
-    for key in ("speed", "jobs"):
-        if key in common:
-            common[key] = float(common[key]) if key == "speed" else int(common[key])
-
     if "notopen_action" not in common:
         common["notopen_action"] = "retry"
     if "use_cookies" in common:
@@ -218,11 +216,53 @@ def build_config_from_args(args):
         "username": args.username,
         "password": args.password,
         "course_list": [item.strip() for item in args.list.split(",") if item.strip()] if args.list else None,
-        "speed": args.speed if args.speed else 1.0,
-        "jobs": args.jobs,
+        "speed": args.speed if args.speed is not None else 1.0,
+        "jobs": args.jobs if args.jobs is not None else 1,
         "notopen_action": args.notopen_action if args.notopen_action else "retry"
     }
     return common_config, {}, {}
+
+
+def validate_study_settings(config):
+    """Application resource limits, not a claim about platform-approved playback."""
+    try:
+        raw_jobs, raw_speed = config.get("jobs", 1), config.get("speed", 1.0)
+        if isinstance(raw_jobs, bool) or isinstance(raw_speed, bool):
+            raise ValueError
+        jobs, speed = float(raw_jobs), float(raw_speed)
+        if not math.isfinite(jobs) or not jobs.is_integer() or not 1 <= jobs <= 16:
+            raise ValueError
+        if not math.isfinite(speed) or not 1 <= speed <= 2:
+            raise ValueError
+    except (ValueError, TypeError, OverflowError):
+        raise ValueError("小节并发数必须是1–16的整数，媒体倍速必须是1–2的有限数值。") from None
+    config["jobs"], config["speed"] = int(jobs), speed
+
+
+def apply_study_settings(common, args):
+    for name in ("jobs", "speed"):
+        value = getattr(args, name, None)
+        if value is not None:
+            common[name] = value
+    if common.get("exam_mode", False):
+        return
+    validate_study_settings(common)
+    if getattr(args, "study_settings", False):
+        print("小节并发数指同时处理几节，不是总共处理几节；章内任务仍串行。")
+        print("推荐并发1、倍速1；高并发/倍速可能导致进度不被认可或次日回退。设置仅用于本轮。")
+        for name, label in (("jobs", "小节并发数（1–16）"), ("speed", "媒体倍速（1–2）")):
+            while True:
+                raw = input(f"{label} [{common[name]}]，回车保留: ").strip()
+                candidate = dict(common)
+                if raw:
+                    candidate[name] = raw
+                try:
+                    validate_study_settings(candidate)
+                except ValueError as error:
+                    print(str(error))
+                    continue
+                common[name] = candidate[name]
+                break
 
 
 def init_config():
@@ -241,20 +281,19 @@ def init_config():
             common["username"] = args.username
         if args.password:
             common["password"] = args.password
-        if args.speed:
-            common["speed"] = args.speed
         if args.list:
             common["course_list"] = [item.strip() for item in args.list.split(",") if item.strip()]
-        if args.jobs:
-            common["jobs"] = args.jobs
         if args.notopen_action:
             common["notopen_action"] = args.notopen_action
         if args.use_cookies:
             common["use_cookies"] = True
+        apply_study_settings(common, args)
         return common, tiku, notification
 
     # 回退: 命令行参数
-    return build_config_from_args(args)
+    common, tiku, notification = build_config_from_args(args)
+    apply_study_settings(common, args)
+    return common, tiku, notification
 
 
 
@@ -368,9 +407,11 @@ class ChapterTask:
 
 class JobProcessor:
     def __init__(self, chaoxing: Chaoxing, course: dict[str, Any], tasks: list[ChapterTask], config: dict[str, Any]):
+        config = dict(config)
+        validate_study_settings(config)
         self.chaoxing = chaoxing
         self.course = course
-        self.speed = 1.0
+        self.speed = config["speed"]
         self.max_tries = 5
         self.tasks = tasks
         self.failed_tasks: list[ChapterTask] = []
@@ -381,10 +422,14 @@ class JobProcessor:
         self.threads: list[threading.Thread] = []
         self.verify_completion = None
         self.progress_error = None
+        self.stop_event = threading.Event()
+        self.chaoxing._study_stop_event = self.stop_event
+        self._error_lock = threading.Lock()
         self._stop_task = ChapterTask(-1, {})
-        self.worker_num = 1
-        if config.get("jobs", 1) != 1 or config.get("speed", 1) != 1:
-            logger.warning("启用保守模式：单章节、单任务、1倍真实计时；忽略旧并发与倍速配置。")
+        self.worker_num = config["jobs"]
+        logger.info("本轮设置：同时处理{}个未完成小节，媒体本地计时{}倍；小节内串行。", self.worker_num, self.speed)
+        if self.worker_num > 1 or self.speed != 1:
+            logger.warning("已选择非保守设置；并发/倍速可能影响平台认可，在线检测与进度核验仍启用。")
         self.config = config
 
     def run(self):
@@ -423,7 +468,7 @@ class JobProcessor:
                 return
 
             try:
-                if self.progress_error is not None:
+                if self.stop_event.is_set():
                     task.result = ChapterResult.DEFERRED
                 else:
                     task.result = process_chapter(self.chaoxing, self.course, task.point, self.speed)
@@ -432,7 +477,10 @@ class JobProcessor:
                         task.result = ChapterResult.DEFERRED
             except ProgressError as e:
                 # Drain queues without making further study requests; main reports the halt.
-                self.progress_error = e
+                with self._error_lock:
+                    if self.progress_error is None:
+                        self.progress_error = e
+                    self.stop_event.set()
                 task.result = ChapterResult.DEFERRED
             except Exception as e:
                 logger.error("处理章节 {} 发生异常: {}", task.point.get("title", ""), e)
@@ -505,6 +553,9 @@ class JobProcessor:
 
 def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, Any], speed:float) -> ChapterResult:
     """处理单个章节"""
+    stop = getattr(chaoxing, "_study_stop_event", None)
+    if stop is not None and stop.is_set() is True:
+        return ChapterResult.DEFERRED
     logger.info(f'当前章节: {point["title"]}')
     if point["has_finished"]:
         logger.info(f'章节：{point["title"]} 已完成所有任务点')
@@ -532,7 +583,9 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
     # Serial within the chapter too; a single worker alone does not prevent overlap.
     job_results:list[StudyResult]=[]
     for job in jobs:
-        result = process_job(chaoxing, course, job, job_info, 1.0)
+        if stop is not None and stop.is_set() is True:
+            return ChapterResult.DEFERRED
+        result = process_job(chaoxing, course, job, job_info, speed)
         job_results.append(result)
         if result.is_failure() and job["type"] == "video":
             break
@@ -597,20 +650,30 @@ def process_course(chaoxing: Chaoxing, course:dict[str, Any], config: dict):
     if config.get("tree_view", True):
         print_course_tree(point_list)
 
-    # 为了支持课程任务回滚, 采用下标方式遍历任务点
-
+    # Start with the earliest unfinished directory entry on every run, not a resume index.
     tasks=[]
 
     for i, point in enumerate(point_list["points"]):
+        if point["has_finished"] is True:
+            continue
         task = ChapterTask(point=point, index=i)
         tasks.append(task)
+    if tasks:
+        logger.info("本轮从最早未完成小节开始：{}；共{}个未完成小节。", tasks[0].point["title"], len(tasks))
     p = JobProcessor(chaoxing, course, tasks, config)
+    # Read and record as one critical section so parallel responses cannot overwrite
+    # a newer snapshot with an older one and falsely trigger a rollback.
+    verification_lock = threading.Lock()
 
     def verify_completed_chapter(point):
-        current = chaoxing.get_course_point(course["courseId"], course["clazzId"], course["cpi"])
-        progress.check_and_record(chaoxing.get_uid(), course, current.get("points"))
-        confirmed = any(str(item["id"]) == str(point["id"]) and item["has_finished"]
-                        for item in current["points"])
+        with verification_lock:
+            stop = getattr(chaoxing, "_study_stop_event", None)
+            if stop is not None and stop.is_set() is True:
+                return False
+            current = chaoxing.get_course_point(course["courseId"], course["clazzId"], course["cpi"])
+            progress.check_and_record(chaoxing.get_uid(), course, current.get("points"))
+            confirmed = any(str(item["id"]) == str(point["id"]) and item["has_finished"] is True
+                            for item in current["points"])
         if not confirmed:
             logger.warning("章节上报与平台完成标记不一致，保留待办，不自动重刷: {}", point["title"])
         return confirmed
@@ -695,8 +758,6 @@ def main():
         # 初始化配置
         common_config, tiku_config, notification_config = init_config()
         
-        # 强制播放按照配置文件调节
-        common_config["speed"] = min(2.0, max(1.0, common_config.get("speed", 1.0)))
         common_config["notopen_action"] = common_config.get("notopen_action", "retry")
         
         # 初始化超星实例
