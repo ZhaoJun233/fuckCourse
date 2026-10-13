@@ -1,4 +1,4 @@
-"""fuckCourse v3.1.2 — unified launcher for course automation tools."""
+"""fuckCourse v3.1.3 — unified launcher for course automation tools."""
 import os
 import sys
 
@@ -137,7 +137,7 @@ def run_yuketang():
 
 def print_banner():
     print("=" * 50)
-    print("             fuckCourse v3.1.2")
+    print("             fuckCourse v3.1.3")
     print("             designed by snake")
     print("=" * 50)
     print()

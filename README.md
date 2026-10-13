@@ -1,4 +1,4 @@
-# fuckCourse v3.1.2
+# fuckCourse v3.1.3
 
 超星学习通 / WE Learn / 智慧树 / 雨课堂 四合一自动刷课工具。
 
@@ -97,7 +97,7 @@ python main.py
 
 ```
 ==================================================
-             fuckCourse v3.1.2
+             fuckCourse v3.1.3
              designed by snake
 ==================================================
 
