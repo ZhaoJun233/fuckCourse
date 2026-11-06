@@ -196,7 +196,7 @@ class TestCredentialWrites(unittest.TestCase):
 
 
 class TestJobProcessorLifecycle(unittest.TestCase):
-    def run_processor(self, behavior, *, notopen_action="retry", legacy=True, task_count=4, verification=None, jobs=1):
+    def run_processor(self, behavior, *, notopen_action="retry", legacy=True, task_count=4, verification=None, jobs=1, retry_wait=None):
         stop_error = getattr(queue, "ShutDown", type("ShutDown", (Exception,), {}))
         queues, spawned = [], []
         abandon = threading.Event()
@@ -236,11 +236,19 @@ class TestJobProcessorLifecycle(unittest.TestCase):
                 calls[point["title"]] = attempt
             return behavior(namespace["ChapterResult"], attempt)
 
+        class RetryEvent(threading.Event):
+            def wait(self, timeout=None):
+                if timeout == 1:
+                    if retry_wait is not None:
+                        retry_wait(dict(calls))
+                    return super().wait(0)
+                return super().wait(timeout)
+
         namespace = {"dataclass": dataclass, "enum": enum, "Any": Any, "math": math,
                      "Chaoxing": object, "PriorityQueue": create_queue,
                      "ShutDown": stop_error, "logger": Mock(), "sys": sys,
                      "threading": SimpleNamespace(Thread=create_thread,
-                                                  Event=threading.Event, Lock=threading.Lock,
+                                                  Event=RetryEvent, Lock=threading.Lock,
                                                   current_thread=threading.current_thread),
                      "time": SimpleNamespace(sleep=lambda _seconds: None),
                      "traceback": traceback, "process_chapter": process_chapter}
@@ -249,7 +257,7 @@ class TestJobProcessorLifecycle(unittest.TestCase):
                          {"ChapterResult", "ChapterTask", "log_error", "validate_study_settings", "JobProcessor"}, namespace)
         tasks = [namespace["ChapterTask"](i, {"title": "chapter-" + str(i)})
                  for i in range(task_count)]
-        processor = namespace["JobProcessor"](SimpleNamespace(), {}, tasks,
+        processor = namespace["JobProcessor"](SimpleNamespace(start_course=Mock(), finish_course=Mock()), {}, tasks,
                                               {"jobs": jobs, "speed": 1, "notopen_action": notopen_action})
         if verification is not None:
             processor.verify_completion = lambda point: verification(namespace, point)
@@ -267,9 +275,11 @@ class TestJobProcessorLifecycle(unittest.TestCase):
             runner.join(timeout=3)
             self.assertFalse(runner.is_alive(), "JobProcessor.run blocked")
             self.assertEqual(errors, [], "JobProcessor.run raised")
-            self.assertEqual(processor.worker_num, jobs, "Configured chapter concurrency must be honored")
+            expected_workers = min(jobs, task_count)
+            self.assertEqual(processor.worker_num, expected_workers, "Concurrency is capped by pending chapters")
             self.assertEqual(processor.speed, 1, "Conservative timing must use real elapsed time")
-            self.assertEqual(len(spawned), jobs + 1, "Expected configured task workers plus retry worker")
+            self.assertEqual(len(spawned), expected_workers + 1 if task_count else 0,
+                             "Empty courses create no task or retry threads")
             self.assertTrue(all(not thread.is_alive() for thread in spawned),
                             "Worker or retry thread survived JobProcessor.run")
             self.assertEqual(set(processor.threads), set(spawned), "Retry worker must be tracked")
@@ -294,6 +304,17 @@ class TestJobProcessorLifecycle(unittest.TestCase):
             lambda results, attempt: results.ERROR if attempt < 3 else results.SUCCESS, jobs=4)
         self.assertEqual(set(calls.values()), {3})
         self.assertEqual(processor.failed_tasks, [])
+
+    def test_retry_wait_happens_before_requeue(self):
+        observed = []
+        _, calls = self.run_processor(
+            lambda results, attempt: results.ERROR if attempt == 1 else results.SUCCESS,
+            task_count=1, retry_wait=observed.append)
+        self.assertEqual(observed, [{"chapter-0": 1}])
+        self.assertEqual(calls, {"chapter-0": 2})
+
+    def test_fewer_chapters_than_requested_workers(self):
+        self.run_processor(lambda results, _attempt: results.SUCCESS, jobs=16, task_count=2)
 
     def test_empty_queue_reclaims_all_workers(self):
         processor, calls = self.run_processor(lambda results, _attempt: results.SUCCESS, task_count=0)

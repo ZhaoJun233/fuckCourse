@@ -11,6 +11,22 @@ from unittest.mock import Mock
 from tests.source_units import load_units
 
 
+class LauncherBannerTests(unittest.TestCase):
+    def test_banner_preserves_product_version_and_separators_without_signature(self):
+        print_banner = load_units("main.py", ["print_banner"])["print_banner"]
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            print_banner()
+
+        banner = output.getvalue()
+        self.assertNotIn("designed by snake", banner)
+        self.assertEqual(
+            banner.splitlines(),
+            ["=" * 50, "             fuckCourse v3.1.3", "=" * 50, ""],
+        )
+
+
 class FrozenLauncherTests(unittest.TestCase):
     def test_platform_returns_wait_before_menu_and_restore_environment(self):
         for source in ("print('章节任务点未完成')", "raise SystemExit(0)",

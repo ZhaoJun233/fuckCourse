@@ -6,6 +6,7 @@ import io
 from concurrent.futures import ThreadPoolExecutor
 import sys
 import traceback
+from threading import Event
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -138,7 +139,7 @@ class LiveRequestTests(unittest.TestCase):
 
 
 class LiveProcessorTests(unittest.TestCase):
-    def run_live(self, statuses, *, speed=1, save=True):
+    def run_live(self, statuses, *, speed=1, save=True, stop_event=None):
         self.live = SimpleNamespace(name='测试直播', required_percent=90,
                                     get_status=Mock(side_effect=statuses), do_finish=Mock(return_value=save))
         self.emit, self.wait, self.draw, self.wipe = Mock(), Mock(), Mock(), Mock()
@@ -148,7 +149,7 @@ class LiveProcessorTests(unittest.TestCase):
         with patch.object(live_process.time, 'sleep', self.wait), \
              patch.object(live_process, '_draw_progress_bar', self.draw, create=True), \
              patch.object(live_process, '_wipe_bar', self.wipe, create=True):
-            return live_process.LiveProcessor.run_live(self.live, speed, emit=self.emit)
+            return live_process.LiveProcessor.run_live(self.live, speed, emit=self.emit, stop_event=stop_event)
 
     def test_unstarted_living_and_no_replay_stay_pending_without_wait_or_write(self):
         for state, review, label in ((0, 1, '未开始'), (1, 0, '正在直播'), (4, 1, '不允许回放')):
@@ -174,6 +175,76 @@ class LiveProcessorTests(unittest.TestCase):
         self.wait.assert_called_once()
         self.assertEqual(self.live.get_status.call_count, 2)
         self.wipe.assert_called_once()
+
+    def test_pre_stopped_replay_makes_no_network_calls(self):
+        stop_event = Event()
+        stop_event.set()
+        self.assertEqual(self.run_live([], stop_event=stop_event), StudyResult.DEFERRED)
+        self.live.get_status.assert_not_called()
+        self.live.do_finish.assert_not_called()
+        self.wait.assert_not_called()
+        self.wipe.assert_called_once()
+
+    def test_cancel_during_wait_never_submits_watch_time(self):
+        stop_event = Event()
+        wait_started = Event()
+        original_wait = stop_event.wait
+
+        def wait_for_stop(timeout):
+            wait_started.set()
+            return original_wait(timeout)
+
+        with patch.object(stop_event, 'wait', side_effect=wait_for_stop) as wait:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(self.run_live, [payload()], stop_event=stop_event)
+                try:
+                    self.assertTrue(wait_started.wait(2), 'Replay never entered the cancellable wait')
+                finally:
+                    stop_event.set()
+                self.assertEqual(future.result(timeout=2), StudyResult.DEFERRED)
+        wait.assert_called_once_with(59)
+        self.live.get_status.assert_called_once_with()
+        self.live.do_finish.assert_not_called()
+        self.wait.assert_not_called()
+        self.wipe.assert_called_once()
+
+    def test_stop_after_wait_timeout_is_checked_before_write(self):
+        stop_event = Event()
+
+        def stop_after_timeout(timeout):
+            stop_event.set()
+            return False
+
+        with patch.object(stop_event, 'wait', side_effect=stop_after_timeout):
+            self.assertEqual(self.run_live([payload()], stop_event=stop_event), StudyResult.DEFERRED)
+        self.live.do_finish.assert_not_called()
+        self.live.get_status.assert_called_once_with()
+
+    def test_unstopped_replay_uses_cancellable_wait_and_server_confirmation(self):
+        stop_event = Event()
+        with patch.object(stop_event, 'wait', return_value=False) as wait:
+            self.assertEqual(self.run_live([payload(percent=20), payload(percent=90)],
+                                           speed=8, stop_event=stop_event), StudyResult.SUCCESS)
+        wait.assert_called_once_with(59)
+        self.live.do_finish.assert_called_once_with()
+        self.assertEqual(self.live.get_status.call_count, 2)
+        self.wait.assert_not_called()
+
+    def test_stop_during_write_prevents_followup_status_request(self):
+        stop_event = Event()
+
+        def stop_during_write():
+            stop_event.set()
+            return True
+
+        live = SimpleNamespace(name='测试直播', required_percent=90,
+                               get_status=Mock(return_value=payload()),
+                               do_finish=Mock(side_effect=stop_during_write))
+        with patch.object(stop_event, 'wait', return_value=False):
+            result = live_process.LiveProcessor.run_live(live, emit=Mock(), stop_event=stop_event)
+        self.assertEqual(result, StudyResult.DEFERRED)
+        live.get_status.assert_called_once_with()
+        live.do_finish.assert_called_once_with()
 
     def test_progress_cleanup_cannot_erase_the_final_result_message(self):
         self.run_live([payload(percent=99.41)])

@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 import functools
+from concurrent.futures import CancelledError
+from copy import deepcopy
 import json
 import math
 import os
@@ -38,6 +40,7 @@ from api.decode import (
 from api.exceptions import MaxRetryExceeded
 from api.online import OnlineDetectionError, OnlineMonitor, course_entry_signature
 from api.progress import ProgressError
+from api.work_prefetch import WorkPrefetcher
 
 _progress_lock = threading.Lock()
 _progress_bars = {}  # key -> bar_text, insertion-ordered on CPython 3.7+
@@ -209,19 +212,25 @@ class Account:
 
 class RateLimiter:
     def __init__(self, call_interval):
-        self.last_call = time.time()
+        self.last_call = time.monotonic()
         self.lock = threading.Lock()
         self.call_interval = call_interval
+        self.stop_event = None
 
-    def limit_rate(self, random_time=False, random_min=0.0, random_max=1.0):
+    def limit_rate(self, random_time=False, random_min=0.0, random_max=1.0, *, stop_event=None):
+        stop = stop_event if stop_event is not None else self.stop_event
+        if stop is not None and stop.is_set():
+            return False
         with self.lock:
-            now = time.time()
+            now = time.monotonic()
             base_wait = max(self.last_call + self.call_interval - now, 0)
             extra_wait = random.uniform(random_min, random_max) if random_time else 0
             call_wait = base_wait + extra_wait
             self.last_call = now + call_wait
-
+        if stop is not None:
+            return not stop.wait(call_wait)
         time.sleep(call_wait)
+        return True
 
 
 class StudyResult(Enum):
@@ -264,6 +273,131 @@ class Chaoxing:
         self.video_log_limiter = RateLimiter(2)  # 上报进度极其容易卡验证码，限制2s一次
         self._study_contexts = {}  # Server-issued entry signatures: memory only, never logged.
         self._online_detection_failed = False
+        self._work_prefetch = None
+        self._course_session = None
+
+    def start_course(self, capacity, stop_event, *, prefetch_work=True):
+        """Own background queries and the platform request guard for one course."""
+        self._study_stop_event = stop_event
+        self._course_session = None
+        self.rate_limiter.stop_event = self.video_log_limiter.stop_event = stop_event
+        self._work_prefetch = None
+        if prefetch_work and self.tiku is not None and not self.tiku.DISABLE:
+            self._work_prefetch = WorkPrefetcher(
+                self.tiku.query, capacity, stop_event,
+                query_delay=float(self.kwargs.get("query_delay", 0)))
+        session = SessionManager.get_session()
+        original = session.request
+
+        def guarded_request(method, url, **kwargs):
+            if stop_event.is_set():
+                raise ProgressError("本轮已停止，未发起新的平台请求。")
+            response = original(method, url, **kwargs)
+            self._check_platform_response(response)
+            return response
+
+        self._course_session = (session, original, guarded_request)
+        session.request = guarded_request
+
+    def finish_course(self):
+        try:
+            if self._work_prefetch is not None:
+                self._work_prefetch.close()
+        finally:
+            self._work_prefetch = None
+            if self._course_session is not None:
+                session, original, guard = self._course_session
+                if session.request is guard:
+                    session.request = original
+                self._course_session = None
+            self.rate_limiter.stop_event = self.video_log_limiter.stop_event = None
+
+    def _check_platform_response(self, response):
+        """Stop on explicit rejection; never discard cookies or retry alternate rt."""
+        status = response.status_code
+        url = str(getattr(response, "url", ""))
+        login = "passport2.chaoxing.com/" in url and "login" in url.lower()
+        content_type = response.headers.get("Content-Type", "")
+        challenge = False
+        if isinstance(content_type, str) and "text/html" in content_type.lower():
+            page = response.text[:65536]
+            challenge = re.search(
+                r"<title>\s*(?:验证码|安全验证|访问验证)\s*</title>",
+                page, re.IGNORECASE) is not None
+            # Some challenge responses have no title. Match only the whole page,
+            # never a keyword contained in a legitimate question or answer.
+            bare_page = re.sub(r"<[^>]*>", "", page).strip()
+            challenge = challenge or bare_page in {"请输入验证码", "安全验证"}
+        if status in (401, 403, 429) or login or challenge:
+            stop = getattr(self, "_study_stop_event", None)
+            if stop is not None:
+                stop.set()
+            raise ProgressError("平台拒绝访问、要求验证或限流，已停止本轮并保留待办；请在官方页面检查。")
+
+    def _wait_study(self, seconds=0):
+        stop = getattr(self, "_study_stop_event", None)
+        if stop is not None:
+            if stop.wait(max(0, seconds)):
+                raise CancelledError()
+        else:
+            time.sleep(max(0, seconds))
+
+    @staticmethod
+    def _work_key(course, job, job_info):
+        return tuple(str(value) for value in (
+            course["courseId"], course["clazzId"],
+            job_info.get("cpi", course.get("cpi", "")),
+            job_info["knowledgeid"], job["jobid"]))
+
+    def prepare_work(self, course, job, job_info):
+        if getattr(self, "_work_prefetch", None) is None:
+            return None
+        try:
+            _, data = self._fetch_work(course, job, job_info, attempts=1)
+            return self._work_prefetch.prepare(self._work_key(course, job, job_info), data["questions"])
+        except ProgressError:
+            raise
+        except CancelledError:
+            return None
+        except Exception as error:
+            logger.debug("提前取题不可用，留待顺序执行时处理: {}", type(error).__name__)
+            return None
+
+    def release_work(self, prepared):
+        if prepared is not None and getattr(self, "_work_prefetch", None) is not None:
+            self._work_prefetch.release(prepared)
+
+    def _prepared_answers(self, course, job, job_info, prepared):
+        if prepared is None or getattr(self, "_work_prefetch", None) is None:
+            return {}
+        try:
+            if prepared.key != self._work_key(course, job, job_info):
+                return {}
+            return self._work_prefetch.answers(prepared)
+        finally:
+            self.release_work(prepared)
+
+    def _query_work_answers(self, course, job, job_info, questions, answers):
+        # Only fresh matching questions are consumed; stale form fields never cross here.
+        answers = dict(answers)
+        missing = [q for q in questions if question_cache_key(q) not in answers]
+        if not missing:
+            return answers
+        prefetch = getattr(self, "_work_prefetch", None)
+        if prefetch is not None:
+            pending = prefetch.prepare(self._work_key(course, job, job_info), missing, wait=True)
+            try:
+                answers.update(prefetch.answers(pending))
+            finally:
+                prefetch.release(pending)
+        else:
+            for question in missing:
+                key = question_cache_key(question)
+                if key not in answers:
+                    self._wait_study(float(self.kwargs.get("query_delay", 0)))
+                    answers[key] = self.tiku.query(deepcopy(question))
+        self._wait_study()
+        return answers
 
     def login(self, login_with_cookies=False):
         if login_with_cookies:
@@ -479,7 +613,6 @@ class Chaoxing:
 
     def get_job_list(self, course: dict, point: dict) -> tuple[list[dict], dict]:
         _session = SessionManager.get_session()
-        self.rate_limiter.limit_rate()
         job_list = []
         job_info = {}
         cards_params = {
@@ -499,6 +632,10 @@ class Chaoxing:
             logger.trace("开始读取章节所有任务点...")
 
             cards_params.update({"num": _possible_num})
+            self.rate_limiter.limit_rate(random_time=True, random_max=0.2)
+            stop = getattr(self, "_study_stop_event", None)
+            if stop is not None and stop.is_set() is True:
+                return [], {"notOpen": True}
             _resp = _session.get("https://mooc1.chaoxing.com/mooc-ans/knowledge/cards", params=cards_params)
             if _resp.status_code != 200:
                 logger.error(f"未知错误: {_resp.status_code} 正在跳过")
@@ -612,30 +749,9 @@ class Chaoxing:
                            "_t": get_timestamp()})
             resp = _session.get(_url, params=params, headers=headers)
         else:
-            logger.warning("Failed to get rt")
-            for rt in [0.9, 1]:
-                if stop is not None and stop.is_set() is True:
-                    return False, 499
-                params.update({"rt": rt,
-                               "_t": get_timestamp()})
-                resp = _session.get(_url, params=params, headers=headers)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if not isinstance(data, dict) or type(data.get("isPassed")) is not bool:
-                        return False, 422
-                    return data["isPassed"], 200
-                # elif resp.ok:
-                #    # TODO: 处理验证码
-                #    pass
-                elif resp.status_code == 403:
-                    logger.warning("出现403报错, 正常尝试切换rt")
-
-                else:
-                    logger.warning("未知错误 jobid={}, status_code={}, 摘要:\n{}",
-                                   _job.get("jobid"),
-                                   resp.status_code,
-                                   resp.text[:200])
-                    break
+            # Keep the legacy default, but never probe alternate values after rejection.
+            params.update({"rt": 0.9, "_t": get_timestamp()})
+            resp = _session.get(_url, params=params, headers=headers)
 
         if resp.status_code == 200:
             data = resp.json()
@@ -643,22 +759,9 @@ class Chaoxing:
                 return False, 422
             return data["isPassed"], 200
 
-        elif resp.status_code == 403:
-            logger.debug(
-                "视频进度上报返回403, jobid={}, 摘要={}",
-                _job.get("jobid"),
-                resp.text[:200],
-            )
-
-            # 若出现两个rt参数都返回403的情况, 则跳过当前任务
-            logger.error("出现403报错, 尝试修复无效, 正在跳过当前任务点...")
-            logger.error("请求url: {}", resp.url)
-            logger.error("请求头: {}", dict(_session.headers) | headers)
-            return False, 403
-
-        logger.error(f"未知错误: {resp.status_code}")
-        logger.error("请求url:", resp.url)
-        logger.error("请求头：", dict(_session.headers) | headers)
+        if resp.status_code in (401, 403, 429) and stop is not None:
+            stop.set()
+        logger.error("媒体进度上报失败: status_code={}", resp.status_code)
         return False, resp.status_code
 
     def _refresh_video_status(self, session: requests.Session, job: dict, _type: Literal["Video", "Audio"]) \
@@ -882,9 +985,51 @@ class Chaoxing:
         else:
             return StudyResult.SUCCESS
 
-    def study_work(self, _course, _job, _job_info) -> StudyResult:
+    def _fetch_work(self, _course, _job, _job_info, *, attempts=3):
+        """Read a fresh work form, with bounded retries only for ordinary failures."""
+        _session = SessionManager.get_session()
+        _url = "https://mooc1.chaoxing.com/mooc-ans/api/work"
+        for attempt in range(attempts):
+            self._wait_study()
+            self.rate_limiter.limit_rate()
+            self._wait_study()
+            try:
+                _resp = _session.get(
+                    _url,
+                    params={
+                        "api": "1",
+                        "workId": _job["jobid"].replace("work-", ""),
+                        "jobid": _job["jobid"],
+                        "originJobId": _job["jobid"],
+                        "needRedirect": "true",
+                        "skipHeader": "true",
+                        "knowledgeid": str(_job_info["knowledgeid"]),
+                        "ktoken": _job_info["ktoken"],
+                        "cpi": _job_info["cpi"],
+                        "ut": "s",
+                        "clazzId": _course["clazzId"],
+                        "type": "",
+                        "enc": _job["enc"],
+                        "mooc2": "1",
+                        "courseid": _course["courseId"],
+                    },
+                    timeout=8,
+                )
+                self._check_platform_response(_resp)
+                if "教师未创建完成该测验" in _resp.text:
+                    raise PermissionError("教师未创建完成该测验")
+                questions = decode_questions_info(_resp.text)
+                if _resp.status_code == 200 and questions.get("questions"):
+                    return _resp, questions
+            except requests.exceptions.RequestException as error:
+                logger.debug("取题请求失败: {}", type(error).__name__)
+            if attempt + 1 < attempts:
+                self._wait_study(2 ** (attempt + 1))
+        raise MaxRetryExceeded(f"超过最大取题尝试次数 ({attempts})")
+
+    def study_work(self, _course, _job, _job_info, *, prepared=None) -> StudyResult:
         # FIXME: 这一块可以单独搞一个类出来了，方法里面又套方法，每一次调用都会创建新的方法，十分浪费
-        if self.tiku.DISABLE or not self.tiku:
+        if self.tiku is None or self.tiku.DISABLE:
             return StudyResult.SUCCESS
         _ORIGIN_HTML_CONTENT = ""  # 用于配合输出网页源码, 帮助修复#391错误
 
@@ -1053,85 +1198,27 @@ class Chaoxing:
             iter_o = iter(o)
             return all(c in iter_o for c in a)
 
-        # FIXME: Use tenacity for retrying
-        def with_retry(max_retries=3, delay=1):
-            def decorator(func):
-                def wrapper(*args, **kwargs):
-                    retries = 0
-                    while retries < max_retries:
-                        try:
-                            _resp = func(*args, **kwargs)
-
-                            # 未创建完成该测验则不进行答题，目前遇到的情况是未创建完成等同于没题目
-                            if '教师未创建完成该测验' in _resp.text:
-                                raise PermissionError("教师未创建完成该测验")
-
-                            questions = decode_questions_info(_resp.text)
-
-                            if _resp.status_code == 200 and questions.get("questions"):
-                                return (_resp, questions)
-
-                            logger.warning(
-                                f"无效响应 (Code: {getattr(_resp, 'status_code', 'Unknown')}), 重试中... ({retries + 1}/{max_retries})")
-
-                        except requests.exceptions.RequestException as e:
-                            logger.warning(f"请求失败: {str(e)[:50]}, 重试中... ({retries + 1}/{max_retries})")
-                        retries += 1
-                        time.sleep(delay * (2 ** retries))
-                    raise MaxRetryExceeded(f"超过最大重试次数 ({max_retries})")
-
-                return wrapper
-
-            return decorator
-
-        # 学习通这里根据参数差异能重定向至两个不同接口, 需要定向至https://mooc1.chaoxing.com/mooc-ans/workHandle/handle
-        _session = SessionManager.get_session()
-
-        _url = "https://mooc1.chaoxing.com/mooc-ans/api/work"
-
-        @with_retry(max_retries=3, delay=1)
-        def fetch_response():
-            return _session.get(
-                _url,
-                params={
-                    "api": "1",
-                    "workId": _job["jobid"].replace("work-", ""),
-                    "jobid": _job["jobid"],
-                    "originJobId": _job["jobid"],
-                    "needRedirect": "true",
-                    "skipHeader": "true",
-                    "knowledgeid": str(_job_info["knowledgeid"]),
-                    "ktoken": _job_info["ktoken"],
-                    "cpi": _job_info["cpi"],
-                    "ut": "s",
-                    "clazzId": _course["clazzId"],
-                    "type": "",
-                    "enc": _job["enc"],
-                    "mooc2": "1",
-                    "courseid": _course["courseId"],
-                }
-            )
-
-        final_resp = {}
-        questions = {}
-
         try:
-            final_resp, questions = fetch_response()
-        except Exception as e:
-            logger.error(f"请求失败: {e}")
+            prefetched = self._prepared_answers(_course, _job, _job_info, prepared)
+            # Await lookup before refreshing tokens, not after retaining an old form.
+            final_resp, questions = self._fetch_work(_course, _job, _job_info)
+            answers = self._query_work_answers(_course, _job, _job_info,
+                                               questions["questions"], prefetched)
+        except ProgressError:
+            raise
+        except CancelledError:
+            return StudyResult.DEFERRED
+        except Exception as error:
+            logger.error("取题或搜题失败: {}", type(error).__name__)
             return StudyResult.ERROR
-
-        _ORIGIN_HTML_CONTENT = final_resp.text  # 用于配合输出网页源码, 帮助修复#391错误
+        _ORIGIN_HTML_CONTENT = final_resp.text
 
         # 搜题
         total_questions = len(questions["questions"])
         found_answers = 0
         for q in questions["questions"]:
             logger.debug(f"当前题目信息 -> {q}")
-            # 添加搜题延迟 #428 - 默认0s延迟
-            query_delay = self.kwargs.get("query_delay", 0)
-            time.sleep(query_delay)
-            res = self.tiku.query(q)
+            res = answers.get(question_cache_key(q))
             answer = ""
             if not res:
                 # 随机答题
@@ -1224,8 +1311,16 @@ class Chaoxing:
 
         del questions["questions"]
 
+        try:
+            self._wait_study()
+            self.rate_limiter.limit_rate()
+            self._wait_study()
+        except CancelledError:
+            return StudyResult.DEFERRED
+        _session = SessionManager.get_session()
         res = _session.post(
             "https://mooc1.chaoxing.com/mooc-ans/work/addStudentWorkNew",
+            timeout=8,
             data=questions,
             headers={
                 "Host": "mooc1.chaoxing.com",
@@ -1240,13 +1335,13 @@ class Chaoxing:
                 "Sec-Fetch-Site": "same-origin",
                 "Sec-Fetch-Mode": "cors",
                 "Sec-Fetch-Dest": "empty",
-                # "Referer": "https://mooc1.chaoxing.com/mooc-ans/work/doHomeWorkNew?courseId=246831735&workAnswerId=52680423&workId=37778125&api=1&knowledgeid=913820156&classId=107515845&oldWorkId=07647c38d8de4c648a9277c5bed7075a&jobid=work-07647c38d8de4c648a9277c5bed7075a&type=&isphone=false&submit=false&enc=1d826aab06d44a1198fc983ed3d243b1&cpi=338350298&mooc2=1&skipHeader=true&originJobId=work-07647c38d8de4c648a9277c5bed7075a",
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,ja;q=0.5",
             },
         )
+        self._check_platform_response(res)
         if res.status_code == 200:
             res_json = res.json()
-            if res_json["status"]:
+            if isinstance(res_json, dict) and res_json.get("status") is True:
                 logger.info(f'{"提交" if questions["pyFlag"] == "" else "保存"}答题成功 -> {res_json["msg"]}')
             else:
                 logger.error(f'{"提交" if questions["pyFlag"] == "" else "保存"}答题失败 -> {res_json["msg"]}')

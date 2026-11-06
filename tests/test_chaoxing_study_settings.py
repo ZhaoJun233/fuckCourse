@@ -28,6 +28,7 @@ class StudySettingsTests(unittest.TestCase):
             args = parse()
         self.assertIsNone(args.jobs)
         self.assertIsNone(args.speed)
+        self.assertIsNone(args.prefetch_work)
 
     def test_config_settings_survive_and_explicit_cli_overrides(self):
         env = settings_env(['parse_args', 'validate_study_settings', 'apply_study_settings'])
@@ -38,6 +39,18 @@ class StudySettingsTests(unittest.TestCase):
         with patch.object(sys, 'argv', ['main.py', '-j', '2', '-s', '1.25']):
             env['apply_study_settings'](common, env['parse_args']())
         self.assertEqual(common, {'jobs': 2, 'speed': 1.25})
+
+    def test_prefetch_config_and_explicit_boolean_flags(self):
+        env = settings_env(['parse_args', 'validate_study_settings', 'apply_study_settings'])
+        config = {'jobs': 1, 'speed': 1, 'prefetch_work': False}
+        for flags, expected in (([], False), (['--prefetch-work'], True),
+                                (['--no-prefetch-work'], False)):
+            with patch.object(sys, 'argv', ['main.py'] + flags):
+                env['apply_study_settings'](config, env['parse_args']())
+            self.assertIs(config['prefetch_work'], expected)
+        for invalid in ('false', 0, 1, None):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                env['validate_study_settings'](dict(config, prefetch_work=invalid))
 
     def test_invalid_values_fail_instead_of_clamping_or_truncating(self):
         validate = settings_env(['validate_study_settings'])['validate_study_settings']
@@ -87,7 +100,7 @@ class ConcurrentChapterTests(unittest.TestCase):
                           'process_chapter': behavior})
         points = [env['ChapterTask'](i, {'id': str(i), 'title': str(i), 'has_finished': False})
                   for i in reversed(range(tasks))]
-        return env['JobProcessor'](SimpleNamespace(), {}, points,
+        return env['JobProcessor'](SimpleNamespace(start_course=Mock(), finish_course=Mock()), {}, points,
                                    {'jobs': jobs, 'speed': speed, 'notopen_action': 'retry'}), env
 
     def test_four_chapters_overlap_but_never_more_than_four(self):

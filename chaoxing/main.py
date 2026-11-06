@@ -67,6 +67,8 @@ def parse_args():
     parser.add_argument("--exam", action="store_true", help="独立期末考试：确认开始、逐题暂存、确认交卷")
     parser.add_argument("--exam-list", action="store_true", help="仅只读列出独立考试，不进入考试")
     parser.add_argument("--study-settings", action="store_true", help="开始刷课前交互设置小节并发数和媒体倍速")
+    parser.add_argument("--prefetch-work", action=argparse.BooleanOptionalAction, default=None,
+                        help="章节执行期间后台搜题；未指定则读取配置")
 
     parser.add_argument(
         "-c", "--config", type=str, default=None, help="使用配置文件运行程序"
@@ -112,6 +114,7 @@ CHAOXING_DEFAULTS = {
         "password": "",
         "speed": 1.0,
         "jobs": 1,
+        "prefetch_work": True,
         "notopen_action": "retry",
         "course_list": [],
         "use_cookies": True,
@@ -236,11 +239,13 @@ def validate_study_settings(config):
             raise ValueError
     except (ValueError, TypeError, OverflowError):
         raise ValueError("小节并发数必须是1–16的整数，媒体倍速必须是1–2的有限数值。") from None
+    if not isinstance(config.get("prefetch_work", True), bool):
+        raise ValueError("prefetch_work 必须是布尔值。")
     config["jobs"], config["speed"] = int(jobs), speed
 
 
 def apply_study_settings(common, args):
-    for name in ("jobs", "speed"):
+    for name in ("jobs", "speed", "prefetch_work"):
         value = getattr(args, name, None)
         if value is not None:
             common[name] = value
@@ -343,8 +348,11 @@ def init_chaoxing(common_config, tiku_config):
     
     return chaoxing
 
-def process_job(chaoxing: Chaoxing, course: dict, job: dict, job_info: dict, speed: float) -> StudyResult:
-    """处理单个任务点"""
+def process_job(chaoxing: Chaoxing, course: dict, job: dict, job_info: dict, speed: float, *, prepared=None) -> StudyResult:
+    """处理单个任务点；预取不改变实际任务执行/提交顺序。"""
+    stop = getattr(chaoxing, "_study_stop_event", None)
+    if stop is not None and stop.is_set() is True:
+        return StudyResult.DEFERRED
     # 视频任务
     if job["type"] == "video":
         logger.trace(f"识别到视频任务, 任务章节: {course['title']} 任务ID: {job['jobid']}")
@@ -364,7 +372,7 @@ def process_job(chaoxing: Chaoxing, course: dict, job: dict, job_info: dict, spe
     # 测验任务
     elif job["type"] == "workid":
         logger.trace(f"识别到章节检测任务, 任务章节: {course['title']}")
-        return chaoxing.study_work(course, job, job_info)
+        return chaoxing.study_work(course, job, job_info, prepared=prepared)
     # 阅读任务
     elif job["type"] == "read":
         logger.trace(f"识别到阅读任务, 任务章节: {course['title']}")
@@ -389,7 +397,9 @@ def process_job(chaoxing: Chaoxing, course: dict, job: dict, job_info: dict, spe
             
             # process_job already runs in the chapter executor. Propagate the real
             # result instead of losing it inside an extra thread and reporting success.
-            return LiveProcessor.run_live(live, speed)
+            return LiveProcessor.run_live(live, speed, stop_event=stop)
+        except ProgressError:
+            raise
         except Exception as e:
             logger.error(f"处理直播任务时出错: {str(e)}")
             return StudyResult.ERROR
@@ -426,33 +436,50 @@ class JobProcessor:
         self.chaoxing._study_stop_event = self.stop_event
         self._error_lock = threading.Lock()
         self._stop_task = ChapterTask(-1, {})
-        self.worker_num = config["jobs"]
+        self.worker_num = min(config["jobs"], len(tasks))
         logger.info("本轮设置：同时处理{}个未完成小节，媒体本地计时{}倍；小节内串行。", self.worker_num, self.speed)
         if self.worker_num > 1 or self.speed != 1:
             logger.warning("已选择非保守设置；并发/倍速可能影响平台认可，在线检测与进度核验仍启用。")
         self.config = config
 
     def run(self):
-        for task in self.tasks:
-            self.task_queue.put(task)
-
-        for i in range(self.worker_num):
-            thread = threading.Thread(target=self.worker_thread, daemon=True)
-            self.threads.append(thread)
-            thread.start()
-
-        retry_worker = threading.Thread(target=self.retry_thread, daemon=True)
-        self.threads.append(retry_worker)
-        retry_worker.start()
-
-        self.task_queue.join()
-        self.retry_queue.join()
-        for _ in range(self.worker_num):
-            self.task_queue.put(self._stop_task)
-        self.retry_queue.put(self._stop_task)
-        for thread in self.threads:
-            thread.join()
-
+        if not self.tasks:
+            return
+        workers = []
+        retry_worker = None
+        try:
+            self.chaoxing.start_course(self.worker_num, self.stop_event,
+                                      prefetch_work=self.config.get("prefetch_work", True))
+            # Start all consumers before queuing work so startup failures can be drained.
+            for _ in range(self.worker_num):
+                thread = threading.Thread(target=self.worker_thread)
+                thread.start()
+                workers.append(thread)
+                self.threads.append(thread)
+            retry_worker = threading.Thread(target=self.retry_thread)
+            retry_worker.start()
+            self.threads.append(retry_worker)
+            try:
+                for task in self.tasks:
+                    self.task_queue.put(task)
+                self.task_queue.join()
+                self.retry_queue.join()
+            except BaseException:
+                self.stop_event.set()
+                self.task_queue.join()
+                self.retry_queue.join()
+                raise
+        except BaseException:
+            self.stop_event.set()
+            raise
+        finally:
+            for _ in workers:
+                self.task_queue.put(self._stop_task)
+            if retry_worker in self.threads:
+                self.retry_queue.put(self._stop_task)
+            for thread in self.threads:
+                thread.join()
+            self.chaoxing.finish_course()
 
     @log_error
     def worker_thread(self):
@@ -472,6 +499,8 @@ class JobProcessor:
                     task.result = ChapterResult.DEFERRED
                 else:
                     task.result = process_chapter(self.chaoxing, self.course, task.point, self.speed)
+                    if self.stop_event.is_set():
+                        task.result = ChapterResult.DEFERRED
                     if (task.result == ChapterResult.SUCCESS and self.verify_completion is not None
                             and self.verify_completion(task.point) is not True):
                         task.result = ChapterResult.DEFERRED
@@ -541,10 +570,11 @@ class JobProcessor:
                 try:
                     if task is self._stop_task:
                         return
+                    # Wait before another worker can start the retry.
+                    self.stop_event.wait(1)
                     self.task_queue.put(task)
                     # Release the previous attempt only after its retry is queued.
                     self.task_queue.task_done()
-                    time.sleep(1) # TODO: Replace with a configurable wait time
                 finally:
                     self.retry_queue.task_done()
         except ShutDown:
@@ -560,9 +590,6 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
     if point["has_finished"]:
         logger.info(f'章节：{point["title"]} 已完成所有任务点')
         return ChapterResult.SUCCESS
-    
-    # 随机等待，避免请求过快
-    chaoxing.rate_limiter.limit_rate(random_time=True,random_min=0, random_max=0.2)
     
     # 获取当前章节的所有任务点
     job_info = None
@@ -580,16 +607,32 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
     for job in jobs:
         job["name"] = point["title"]
 
-    # Serial within the chapter too; a single worker alone does not prevent overlap.
-    job_results:list[StudyResult]=[]
-    for job in jobs:
-        if stop is not None and stop.is_set() is True:
-            return ChapterResult.DEFERRED
-        result = process_job(chaoxing, course, job, job_info, speed)
-        job_results.append(result)
-        if result.is_failure() and job["type"] == "video":
-            break
-    
+    # Only lookup overlaps; execution and submission retain chapter order.
+    job_results: list[StudyResult] = []
+    prepared = None
+    prepared_job = None
+    try:
+        for index, job in enumerate(jobs):
+            if stop is not None and stop.is_set() is True:
+                return ChapterResult.DEFERRED
+            if prepared_job is None:
+                prepared_job = next((item for item in jobs[index:]
+                                     if item["type"] == "workid"), None)
+                if prepared_job is not None and prepared_job is not job:
+                    prepared = chaoxing.prepare_work(course, prepared_job, job_info)
+            if job is prepared_job and prepared is not None:
+                result = process_job(chaoxing, course, job, job_info, speed, prepared=prepared)
+            else:
+                result = process_job(chaoxing, course, job, job_info, speed)
+            if job is prepared_job:
+                chaoxing.release_work(prepared)
+                prepared = prepared_job = None
+            job_results.append(result)
+            if result.is_failure() and job["type"] == "video":
+                break
+    finally:
+        chaoxing.release_work(prepared)
+
     for result in job_results:
         if result.is_failure() and result != StudyResult.DEFERRED:
             return ChapterResult.ERROR

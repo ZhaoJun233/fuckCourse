@@ -77,22 +77,9 @@ def getEv(data:list, key:str="zzpttjd"):
     return ev
 
 if __name__ == "__main__":
-    v = Cipher()
-    h = Cipher(HOME_KEY)
-    q = Cipher(QA_KEY)
-    e = Cipher(EXAM_KEY)
-    a = Cipher(AI_KEY)
-    
-    #print(getEv([1,2,3,4,'你']))
-    # d = "R8b5YgowBZhvyiaFlYAhdoTbupkjQBWiT2cwpDf275SvouM6xvxeAv9YdvdYw97tfmjBuqoXPcj7ptqnWJcFPwtWZMv6Ptld70F5yIl8R9Q="
-    # r = ObjDict(json.loads(q.decrypt(d)))
-    # print(r)
-    # #print(r.watchPoint)
-    # print(revEv(r.sdsew))
-
-    encoded = a.encrypt(json.dumps({'courseId': '1839576198548688896', 'classId': 4239, 'dateFormate': 1729175218000}))
+    # Local round-trip example with synthetic data only.
+    cipher = Cipher()
+    sample = {"courseId": "example-course", "classId": 0, "dateFormate": 0}
+    encoded = cipher.encrypt(json.dumps(sample))
     print(encoded)
-
-    decoded = e.decrypt("xI1pFlV/3UmvLdGDXuK0f2iiN+Po+oSemJWfhnvgzCu9/KU6P2vSWty3Qe2QIxtGJ/Ik+jvUrnNZJZEXvandQiv4039O/MevpN5QUEhDwNJ1Yep+dYhGjdBOgkzjUvxl")
-
-    print(decoded)
+    print(cipher.decrypt(encoded))

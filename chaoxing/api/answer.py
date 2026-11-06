@@ -7,6 +7,8 @@ import shutil
 import tempfile
 import threading
 import time
+from contextlib import ExitStack, contextmanager
+from copy import deepcopy
 from pathlib import Path
 from re import sub
 from typing import Optional
@@ -22,7 +24,7 @@ from api.logger import logger
 # 关闭警告
 disable_warnings(exceptions.InsecureRequestWarning)
 
-__all__ = ["CacheDAO", "Tiku", "TikuFallback", "TikuYanxi", "TikuGo", "TikuLike", "TikuAdapter", "AI", "SiliconFlow"]
+__all__ = ["question_cache_key", "CacheDAO", "Tiku", "TikuFallback", "TikuYanxi", "TikuGo", "TikuLike", "TikuAdapter", "AI", "SiliconFlow"]
 
 
 def _remove_md_json_wrapper(md_str):
@@ -42,23 +44,26 @@ class CacheDAO:
     DEFAULT_CACHE_FILE = "cache.json"
 
     _instance = None
+    _instance_lock = threading.Lock()
     _cache = None
 
     def __new__(cls, file: str = None):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._initialized = False
-        return cls._instance
+        with cls._instance_lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance._initialized = False
+            return cls._instance
 
     def __init__(self, file: str = None):
-        if self._initialized:
-            return
-        self._initialized = True
-
-        self.cache_file = Path(file or self.DEFAULT_CACHE_FILE)
-        self._lock = threading.RLock()
-        self._dirty = False
-        self.__class__._cache = self._read_cache()
+        # 只有完整加载后才发布已初始化状态；其他构造调用必须等待。
+        with self.__class__._instance_lock:
+            if self._initialized:
+                return
+            self.cache_file = Path(file or self.DEFAULT_CACHE_FILE)
+            self._lock = threading.RLock()
+            self._dirty = False
+            self.__class__._cache = self._read_cache()
+            self._initialized = True
 
     def _read_cache(self) -> dict:
         # 新增缓存文件读取的异常处理
@@ -146,12 +151,32 @@ class CacheDAO:
             logger.error(f"Failed to write cache: {e}")
 
     def get_cache(self, question: str) -> Optional[str]:
-        return self.__class__._cache.get(question)
+        with self._lock:
+            return self.__class__._cache.get(question)
 
     def add_cache(self, question: str, answer: str) -> None:
         with self._lock:
             self.__class__._cache[question] = answer
             self._write_cache(self.__class__._cache)
+
+
+def _normalize_question_title(title: str) -> str:
+    title = sub(r"^\d+", "", title.strip())
+    return sub(r"（\d+\.\d+分）$", "", title).strip()
+
+
+def question_cache_key(q_info: dict) -> str:
+    """Return a versioned identity without changing input or consulting the cache.
+
+    Requires a string title, a type, and JSON-serializable options (default []).
+    List order and every option field matter; dictionary key order does not.
+    Missing fields raise KeyError; non-serializable options raise TypeError.
+    """
+    return "v2:" + json.dumps(
+        {"title": _normalize_question_title(q_info["title"]), "type": q_info["type"],
+         "options": q_info.get("options", [])},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
 
 
 # TODO: 重构此部分代码，将此类改为抽象类，加载题库方法改为静态方法，禁止直接初始化此类
@@ -229,25 +254,26 @@ class Tiku:
         if self.DISABLE:
             return None
 
-        # 预处理, 去除【单选题】这样与标题无关的字段
+        # 标题预处理及 provider 的嵌套修改均不能影响调用方的题目。
+        q_info = deepcopy(q_info)
+        cache_key = question_cache_key(q_info)
         logger.debug(f"原始标题：{q_info['title']}")
-        q_info['title'] = sub(r'^\d+', '', q_info['title'])
-        q_info['title'] = sub(r'（\d+\.\d+分）$', '', q_info['title'])
+        q_info['title'] = _normalize_question_title(q_info['title'])
         logger.debug(f"处理后标题：{q_info['title']}")
 
-        # 先过缓存
+        # v2 保留完整选项及顺序，不能回退到可能属于其他题目的旧题干键。
         cache_dao = CacheDAO()
-        answer = cache_dao.get_cache(q_info['title'])
+        answer = cache_dao.get_cache(cache_key)
         if answer:
             logger.info(f"从缓存中获取答案：{q_info['title']} -> {answer}")
             return answer.strip()
         else:
             answer = self._query(q_info)
-            if answer:
+            if isinstance(answer, str) and answer.strip():
                 answer = answer.strip()
                 logger.info(f"从{self.name}获取答案：{q_info['title']} -> {answer}")
                 if check_answer(answer, q_info['type'], self):
-                    cache_dao.add_cache(q_info['title'], answer)
+                    cache_dao.add_cache(cache_key, answer)
                     return answer
                 else:
                     logger.info(f"从{self.name}获取到的答案类型与题目类型不符，已舍弃")
@@ -998,6 +1024,7 @@ class TikuAdapter(Tiku):
 
 class AI(Tiku):
     # AI大模型答题实现
+    REQUEST_TIMEOUT_SECONDS = 30
     def __init__(self) -> None:
         super().__init__()
         self.name = 'AI大模型答题'
@@ -1026,13 +1053,24 @@ class AI(Tiku):
                 logger.debug(f"API请求间隔过短, 等待 {sleep_time} 秒")
                 time.sleep(sleep_time)
 
+    @contextmanager
+    def _open_client(self):
+        # SDK retries would multiply the request deadline; own every client explicitly.
+        with ExitStack() as stack:
+            kwargs = {"base_url": self.endpoint, "api_key": self.key,
+                      "timeout": self.REQUEST_TIMEOUT_SECONDS, "max_retries": 0}
+            if self.http_proxy:
+                kwargs["http_client"] = stack.enter_context(httpx.Client(
+                    proxy=self.http_proxy, timeout=self.REQUEST_TIMEOUT_SECONDS,
+                ))
+            client = stack.enter_context(OpenAI(**kwargs))
+            yield client
+
     def _query(self, q_info: dict):
-        if self.http_proxy:
-            proxy = self.http_proxy
-            httpx_client = httpx.Client(proxy=proxy)
-            client = OpenAI(http_client=httpx_client, base_url = self.endpoint,api_key = self.key)
-        else:
-            client = OpenAI(base_url = self.endpoint,api_key = self.key)
+        with self._open_client() as client:
+            return self._query_with_client(q_info, client)
+
+    def _query_with_client(self, q_info: dict, client):
         # 去除选项字母，防止大模型直接输出字母而非内容
         options_list = q_info['options'].split('\n')
         cleaned_options = [re.sub(r"^[A-Z]\s*", "", option) for option in options_list]
@@ -1137,25 +1175,20 @@ class AI(Tiku):
         """
         logger.info(f'正在检查 {self.name} 连接...')
         try:
-            if self.http_proxy:
-                httpx_client = httpx.Client(proxy=self.http_proxy)
-                client = OpenAI(http_client=httpx_client, base_url=self.endpoint, api_key=self.key)
-            else:
-                client = OpenAI(base_url=self.endpoint, api_key=self.key)
-
-            # 发送一个简单的测试请求
-            self._wait_for_interval()
-            self.last_request_time = time.time()
-            completion = client.chat.completions.create(**self._completion_kwargs(
-                model=self.model,
-                messages=[
-                    {
-                        'role': 'user',
-                        'content': '你好，请回答：1+1 等于几？只回答数字。'
-                    }
-                ],
-                max_tokens=64
-            ))
+            with self._open_client() as client:
+                # 发送一个简单的测试请求
+                self._wait_for_interval()
+                self.last_request_time = time.time()
+                completion = client.chat.completions.create(**self._completion_kwargs(
+                    model=self.model,
+                    messages=[
+                        {
+                            'role': 'user',
+                            'content': '你好，请回答：1+1 等于几？只回答数字。'
+                        }
+                    ],
+                    max_tokens=64
+                ))
             
             if completion.choices and completion.choices[0].message.content:
                 logger.info(f'{self.name} 连接检查成功')

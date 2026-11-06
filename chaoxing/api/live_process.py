@@ -25,11 +25,16 @@ def _show_status(live, snapshot, emit):
 
 class LiveProcessor:
     @staticmethod
-    def run_live(live: Live, speed: float = 1.0, *, emit=print):
-        """Only replay permitted by the platform; never infer completion from elapsed time."""
+    def run_live(live: Live, speed: float = 1.0, *, emit=print, stop_event=None):
+        """Only replay permitted by the platform; never infer completion from elapsed time.
+
+        An optional threading.Event interrupts waits and defers remaining requests.
+        """
         prefix = f"直播回放 {live.name}"
         notice = ""
         try:
+            if stop_event is not None and stop_event.is_set():
+                return StudyResult.DEFERRED
             snapshot = parse_live_status(live.get_status())
             _show_status(live, snapshot, emit)
             if snapshot.state in {LiveState.NOT_STARTED, LiveState.LIVING, LiveState.ENDED}:
@@ -52,9 +57,16 @@ class LiveProcessor:
                     notice = "平台确认已达到直播回放完成比例。"
                     return StudyResult.SUCCESS
                 # Existing heartbeat protocol credits elapsed viewing time, not a speed multiplier.
-                time.sleep(59)
+                if stop_event is None:
+                    time.sleep(59)
+                elif stop_event.wait(59):
+                    return StudyResult.DEFERRED
+                if stop_event is not None and stop_event.is_set():
+                    return StudyResult.DEFERRED
                 if not live.do_finish():
                     raise LiveError("直播时长请求未确认成功，已停止；未标记完成。")
+                if stop_event is not None and stop_event.is_set():
+                    return StudyResult.DEFERRED
                 latest = parse_live_status(live.get_status())
                 # Keep the console's reserved progress-bar rows stable. The bar
                 # shows refreshed progress; detailed periodic snapshots go to the log.
