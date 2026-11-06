@@ -23,7 +23,7 @@ class LauncherBannerTests(unittest.TestCase):
         self.assertNotIn("designed by snake", banner)
         self.assertEqual(
             banner.splitlines(),
-            ["=" * 50, "             fuckCourse v3.1.3", "=" * 50, ""],
+            ["=" * 50, "             fuckCourse v3.1.4", "=" * 50, ""],
         )
 
 
