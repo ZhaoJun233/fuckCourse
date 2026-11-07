@@ -36,6 +36,13 @@ class PackagingTests(unittest.TestCase):
             self.assertEqual(archive_names, expected_project_entries())
             validate_archive_names(archive_names)
 
+    def test_request_policy_is_in_allowlist(self):
+        required = "chaoxing/api/request_policy.py"
+        self.assertIn(required, expected_project_entries())
+        data_entries = {(Path(source).relative_to(ROOT).as_posix(), destination)
+                        for source, destination in project_datas(ROOT)}
+        self.assertIn((required, "chaoxing/api"), data_entries)
+
     def test_missing_build_input_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(ValueError):
@@ -43,6 +50,20 @@ class PackagingTests(unittest.TestCase):
 
     def test_archive_rejects_secret_and_unlisted_platform_entries(self):
         for name in ("zhs/logs/debug.log", "chaoxing/cookies.json", "yuketang/config.json", "welearn/private.py", "zhs/cache/data.bin", "config.json.corrupt.bak", "private.har"):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                validate_archive_names(expected_project_entries() | {name})
+
+    def test_archive_rejects_private_metadata_and_session_exports(self):
+        private_names = (
+            ".dsh/session.v4.jsonl", ".DSH/session.v4.jsonl",
+            "cache/.dsh/context.json", ".git/config",
+            ".codegraph/graph.db", ".jspace/state.md",
+            ".env", ".env.local", "cache/.env.production",
+            "session.v4.jsonl", "session.jsonl", "dsh-session-private.zip",
+            ".netrc", ".npmrc", ".pypirc", ".git-credentials",
+            "credentials.json", "tokens.json", "CHAOXING/private.txt",
+        )
+        for name in private_names:
             with self.subTest(name=name), self.assertRaises(ValueError):
                 validate_archive_names(expected_project_entries() | {name})
 
@@ -102,6 +123,18 @@ class SourceProbeTests(unittest.TestCase):
                 result = self.run_probe(platform)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn(f"SMOKE_IMPORT_OK {platform}", result.stdout.splitlines())
+
+    def test_chaoxing_from_only_allowlisted_sources_imports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mirror = Path(tmp)
+            for source, destination in project_datas(ROOT):
+                target = mirror / destination / Path(source).name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(Path(source).read_bytes())
+            result = self.run_probe("chaoxing", mirror)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("SMOKE_IMPORT_OK chaoxing", result.stdout.splitlines())
+            self.assertFalse((mirror / "cookies.json").exists())
 
     def test_probe_skips_top_level_business_operations(self):
         with tempfile.TemporaryDirectory() as tmp:

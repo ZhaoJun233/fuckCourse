@@ -346,7 +346,7 @@ class CourseRecheckTests(unittest.TestCase):
                'ChapterResult': result, 'threading': threading,
                'ChapterTask': lambda point, index: SimpleNamespace(point=point, index=index),
                'print_course_tree': Mock()}
-        run = load_units('chaoxing/main.py', ['process_course'], env)['process_course']
+        run = load_units('chaoxing/main.py', ['_get_course_point_with_policy', 'process_course'], env)['process_course']
         return run, cx, store, result
 
     def test_final_unconfirmed_chapter_is_not_announced_as_complete(self):
@@ -369,3 +369,10 @@ class CourseRecheckTests(unittest.TestCase):
         p = run(cx, {'courseId': 'c', 'clazzId': 'b', 'cpi': 'p', 'title': 'course'}, {})
         self.assertEqual(p.failed_tasks, [])
         self.assertEqual(store.check_and_record.call_count, 2)
+        self.assertEqual(2, cx.start_course.call_count)
+        self.assertEqual(2, cx.finish_course.call_count)
+        first, final = cx.start_course.call_args_list
+        self.assertIsNot(first.args[1], final.args[1])
+        for started in (first, final):
+            self.assertEqual(1, started.args[0])
+            self.assertEqual({'prefetch_work': False}, started.kwargs)

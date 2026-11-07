@@ -1,9 +1,11 @@
 """Offline tests for chapter concurrency, settings precedence and directory order."""
 import argparse
+import ast
 import contextlib
 from dataclasses import dataclass
 import enum
 import io
+import importlib.util
 import math
 import queue
 import sys
@@ -13,12 +15,19 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from tests.source_units import load_units
+from tests.source_units import ROOT, load_units
+
+
+REQUEST_SPEC = importlib.util.spec_from_file_location(
+    "study_settings_request_policy", ROOT / "chaoxing/api/request_policy.py")
+REQUEST_POLICY = importlib.util.module_from_spec(REQUEST_SPEC)
+REQUEST_SPEC.loader.exec_module(REQUEST_POLICY)
 
 
 def settings_env(names):
     return load_units('chaoxing/main.py', names,
-                      {'argparse': argparse, 'sys': sys, 'math': math, 'logger': Mock()})
+                      {'argparse': argparse, 'sys': sys, 'math': math, 'logger': Mock(),
+                       'validate_request_settings': REQUEST_POLICY.validate_request_settings})
 
 
 class StudySettingsTests(unittest.TestCase):
@@ -29,16 +38,19 @@ class StudySettingsTests(unittest.TestCase):
         self.assertIsNone(args.jobs)
         self.assertIsNone(args.speed)
         self.assertIsNone(args.prefetch_work)
+        self.assertIsNone(args.request_interval)
+        self.assertIsNone(args.request_jitter)
+        self.assertIsNone(args.cookie_cleanup)
 
     def test_config_settings_survive_and_explicit_cli_overrides(self):
         env = settings_env(['parse_args', 'validate_study_settings', 'apply_study_settings'])
         common = {'jobs': 4, 'speed': 1.5}
         with patch.object(sys, 'argv', ['main.py']):
             env['apply_study_settings'](common, env['parse_args']())
-        self.assertEqual(common, {'jobs': 4, 'speed': 1.5})
+        self.assertEqual((common['jobs'], common['speed']), (4, 1.5))
         with patch.object(sys, 'argv', ['main.py', '-j', '2', '-s', '1.25']):
             env['apply_study_settings'](common, env['parse_args']())
-        self.assertEqual(common, {'jobs': 2, 'speed': 1.25})
+        self.assertEqual((common['jobs'], common['speed']), (2, 1.25))
 
     def test_prefetch_config_and_explicit_boolean_flags(self):
         env = settings_env(['parse_args', 'validate_study_settings', 'apply_study_settings'])
@@ -76,7 +88,7 @@ class StudySettingsTests(unittest.TestCase):
                 patch('builtins.input', side_effect=['0', '', 'nan', '2']), \
                 contextlib.redirect_stdout(io.StringIO()):
             env['apply_study_settings'](common, env['parse_args']())
-        self.assertEqual(common, {'jobs': 4, 'speed': 2})
+        self.assertEqual((common['jobs'], common['speed']), (4, 2))
 
     def test_launcher_prompts_only_for_chapter_mode(self):
         env = load_units('main.py', ['run_chaoxing', 'run_chaoxing_exam'],
@@ -85,6 +97,92 @@ class StudySettingsTests(unittest.TestCase):
         self.assertIn('--study-settings', env['_run'].call_args.args[1])
         env['run_chaoxing_exam']()
         self.assertNotIn('--study-settings', env['_run'].call_args.args[1])
+
+
+class RequestSettingsTests(unittest.TestCase):
+    def test_default_speed_jobs_and_request_settings_remain_customizable(self):
+        tree = ast.parse((ROOT / 'chaoxing/main.py').read_text(encoding='utf-8-sig'))
+        assignment = next(node for node in tree.body if isinstance(node, ast.Assign)
+                          and any(isinstance(target, ast.Name) and target.id == 'CHAOXING_DEFAULTS'
+                                  for target in node.targets))
+        defaults = ast.literal_eval(assignment.value)['common']
+        self.assertEqual((defaults['jobs'], defaults['speed']), (1, 1.0))
+        self.assertEqual(defaults['request_interval'], 0.5)
+        self.assertEqual(defaults['request_jitter'], 0.2)
+        self.assertEqual(defaults['cookie_cleanup_names'], [])
+
+    def test_saved_request_settings_survive_and_cli_can_override_them(self):
+        env = settings_env(['parse_args', 'validate_study_settings', 'apply_study_settings'])
+        common = {'jobs': 7, 'speed': 1.75, 'prefetch_work': False,
+                  'request_interval': 0.8, 'request_jitter': 0.4,
+                  'cookie_cleanup_names': ['synthetic_old_marker']}
+        expected = dict(common)
+        with patch.object(sys, 'argv', ['main.py']):
+            env['apply_study_settings'](common, env['parse_args']())
+        self.assertEqual(common, expected)
+        flags = ['main.py', '-j', '8', '-s', '2', '--prefetch-work',
+                 '--request-interval', '0.25', '--request-jitter', '0',
+                 '--cookie-cleanup', 'synthetic_a, synthetic_b,synthetic_a']
+        with patch.object(sys, 'argv', flags):
+            env['apply_study_settings'](common, env['parse_args']())
+        self.assertEqual(common, {'jobs': 8, 'speed': 2.0, 'prefetch_work': True,
+                                  'request_interval': 0.25, 'request_jitter': 0.0,
+                                  'cookie_cleanup_names': ['synthetic_a', 'synthetic_b']})
+
+    def test_empty_cookie_cleanup_flag_explicitly_disables_cleanup(self):
+        env = settings_env(['parse_args', 'validate_study_settings', 'apply_study_settings'])
+        common = {'jobs': 3, 'speed': 1.25, 'cookie_cleanup_names': ['synthetic_marker']}
+        with patch.object(sys, 'argv', ['main.py', '--cookie-cleanup', '']):
+            env['apply_study_settings'](common, env['parse_args']())
+        self.assertEqual(common['cookie_cleanup_names'], [])
+        self.assertEqual((common['jobs'], common['speed']), (3, 1.25))
+
+    def test_request_cli_values_are_validated_before_study_prompts(self):
+        env = settings_env(['parse_args', 'validate_study_settings', 'apply_study_settings'])
+        for flags in (['--request-interval', '0'], ['--request-jitter', 'nan'],
+                      ['--cookie-cleanup', '_uid'], ['--cookie-cleanup', 'cf_clearance'],
+                      ['--cookie-cleanup', 'synthetic_a,,synthetic_b'],
+                      ['--cookie-cleanup', 'synthetic=value']):
+            with self.subTest(flags=flags), patch.object(sys, 'argv', ['main.py', '--study-settings', *flags]), \
+                    patch('builtins.input') as prompt, self.assertRaises(ValueError):
+                env['apply_study_settings']({'jobs': 1, 'speed': 1}, env['parse_args']())
+            prompt.assert_not_called()
+
+    def test_request_settings_reach_client_without_changing_video_or_jobs(self):
+        env = settings_env(['init_chaoxing'])
+        account, provider, client = object(), Mock(), object()
+        tiku = Mock()
+        tiku.get_tiku_from_config.return_value = provider
+        env.update({'Account': Mock(return_value=account), 'Tiku': Mock(return_value=tiku),
+                    'Chaoxing': Mock(return_value=client), 'Notification': Mock()})
+        cookies = SimpleNamespace(use_cookies=Mock(return_value={}))
+        common = {'username': 'SYNTHETIC_USER', 'password': 'NOT_REAL', 'jobs': 6, 'speed': 1.75,
+                  'request_interval': '0.75', 'request_jitter': '0',
+                  'cookie_cleanup_names': ['synthetic_marker']}
+        with patch.dict(sys.modules, {'api.cookies': cookies}):
+            result = env['init_chaoxing'](common, {'delay': 0.2})
+        self.assertIs(result, client)
+        env['Chaoxing'].assert_called_once_with(account=account, tiku=provider, query_delay=0.2,
+                                              request_interval=0.75, request_jitter=0.0,
+                                              cookie_cleanup_names=['synthetic_marker'])
+        self.assertEqual((common['jobs'], common['speed']), (6, 1.75))
+        provider.init_tiku.assert_called_once_with()
+
+    def test_invalid_request_config_fails_before_cookies_or_provider_are_loaded(self):
+        env = settings_env(['init_chaoxing'])
+        env.update({'Account': Mock(), 'Tiku': Mock(), 'Chaoxing': Mock()})
+        cookies = SimpleNamespace(use_cookies=Mock(return_value={}))
+        invalid = ({'request_interval': 0.09}, {'request_interval': float('inf')},
+                   {'request_jitter': True}, {'request_jitter': 5.1},
+                   {'cookie_cleanup_names': ['JSESSIONID']})
+        for config in invalid:
+            with self.subTest(config=config), patch.dict(sys.modules, {'api.cookies': cookies}), \
+                    self.assertRaises(ValueError):
+                env['init_chaoxing'](config, {})
+        cookies.use_cookies.assert_not_called()
+        env['Account'].assert_not_called()
+        env['Tiku'].assert_not_called()
+        env['Chaoxing'].assert_not_called()
 
 
 class ConcurrentChapterTests(unittest.TestCase):
@@ -193,7 +291,7 @@ class ConcurrentChapterTests(unittest.TestCase):
                     thread.join(2)
                     if thread.is_alive():
                         raise AssertionError('Verification worker did not exit')
-        env = load_units('chaoxing/main.py', ['process_course'],
+        env = load_units('chaoxing/main.py', ['_get_course_point_with_policy', 'process_course'],
                          {'logger': Mock(), 'ProgressStore': lambda: store, 'JobProcessor': Processor,
                           'threading': threading, 'ChapterResult': results,
                           'ChapterTask': lambda point, index: SimpleNamespace(point=point, index=index),
@@ -217,7 +315,7 @@ class ConcurrentChapterTests(unittest.TestCase):
             def run(self):
                 for task in self.tasks:
                     task.result = result.SUCCESS
-        env = load_units('chaoxing/main.py', ['process_course'],
+        env = load_units('chaoxing/main.py', ['_get_course_point_with_policy', 'process_course'],
                          {'logger': Mock(), 'ProgressStore': Mock(), 'JobProcessor': Processor,
                           'threading': threading, 'ChapterResult': result,
                           'ChapterTask': lambda point, index: SimpleNamespace(point=point, index=index),

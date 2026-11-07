@@ -29,6 +29,7 @@ from api.live import Live
 from api.live_process import LiveProcessor
 from api.exam_runner import run_exam_mode
 from api.progress import ProgressStore, ProgressError
+from api.request_policy import validate_request_settings
 
 class ChapterResult(enum.Enum):
     SUCCESS=0,
@@ -66,9 +67,17 @@ def parse_args():
     parser.add_argument("--use-cookies", action="store_true", help="使用cookies登录")
     parser.add_argument("--exam", action="store_true", help="独立期末考试：确认开始、逐题暂存、确认交卷")
     parser.add_argument("--exam-list", action="store_true", help="仅只读列出独立考试，不进入考试")
-    parser.add_argument("--study-settings", action="store_true", help="开始刷课前交互设置小节并发数和媒体倍速")
+    parser.add_argument("--study-settings", action="store_true", help="开始刷课前交互设置小节并发数和视频倍速（直播原速）")
     parser.add_argument("--prefetch-work", action=argparse.BooleanOptionalAction, default=None,
-                        help="章节执行期间后台搜题；未指定则读取配置")
+                        help="章节执行期间独立后台搜题；未指定则读取配置")
+    parser.add_argument("--request-interval", type=float, default=None,
+                        help="课程共享请求的最短间隔（秒）；未指定则读取配置")
+    parser.add_argument("--request-jitter", type=float, default=None,
+                        help="请求间隔额外随机等待的上限（秒）；未指定则读取配置")
+    parser.add_argument("--cookie-cleanup", type=str, default=None, metavar="NAME[,NAME...]",
+                        help="明确 Cookie 名单：启动前一次，明确风控停止后的收尾一次；"
+                             "默认不清理，空字符串禁用，登录/验证 Cookie 受保护；"
+                             "不自动识别标记名，不自动重试/重登，不保证解除服务器限制")
 
     parser.add_argument(
         "-c", "--config", type=str, default=None, help="使用配置文件运行程序"
@@ -79,7 +88,7 @@ def parse_args():
         "-l", "--list", type=str, default=None, help="要学习的课程ID列表, 以 , 分隔"
     )
     parser.add_argument(
-        "-s", "--speed", type=float, default=None, help="媒体本地计时倍速（1–2）；未指定则使用配置，不保证平台认可"
+        "-s", "--speed", type=float, default=None, help="视频本地计时倍速（1–2）；直播固定原速，未指定则使用配置，不保证平台认可"
     )
     parser.add_argument(
         "-j", "--jobs", type=int, default=None, help="同时处理的未完成小节数（1–16）；小节内任务仍串行"
@@ -115,6 +124,9 @@ CHAOXING_DEFAULTS = {
         "speed": 1.0,
         "jobs": 1,
         "prefetch_work": True,
+        "request_interval": 0.5,
+        "request_jitter": 0.2,
+        "cookie_cleanup_names": [],
         "notopen_action": "retry",
         "course_list": [],
         "use_cookies": True,
@@ -238,24 +250,28 @@ def validate_study_settings(config):
         if not math.isfinite(speed) or not 1 <= speed <= 2:
             raise ValueError
     except (ValueError, TypeError, OverflowError):
-        raise ValueError("小节并发数必须是1–16的整数，媒体倍速必须是1–2的有限数值。") from None
+        raise ValueError("小节并发数必须是1–16的整数，视频倍速必须是1–2的有限数值（直播固定原速）。") from None
     if not isinstance(config.get("prefetch_work", True), bool):
         raise ValueError("prefetch_work 必须是布尔值。")
     config["jobs"], config["speed"] = int(jobs), speed
 
 
 def apply_study_settings(common, args):
-    for name in ("jobs", "speed", "prefetch_work"):
+    for name in ("jobs", "speed", "prefetch_work", "request_interval", "request_jitter"):
         value = getattr(args, name, None)
         if value is not None:
             common[name] = value
+    cookie_names = getattr(args, "cookie_cleanup", None)
+    if cookie_names is not None:
+        common["cookie_cleanup_names"] = cookie_names
+    validate_request_settings(common)
     if common.get("exam_mode", False):
         return
     validate_study_settings(common)
     if getattr(args, "study_settings", False):
         print("小节并发数指同时处理几节，不是总共处理几节；章内任务仍串行。")
-        print("推荐并发1、倍速1；高并发/倍速可能导致进度不被认可或次日回退。设置仅用于本轮。")
-        for name, label in (("jobs", "小节并发数（1–16）"), ("speed", "媒体倍速（1–2）")):
+        print("推荐并发1、视频倍速1；直播固定原速。高并发/倍速可能导致进度不被认可或次日回退。设置仅用于本轮。")
+        for name, label in (("jobs", "小节并发数（1–16）"), ("speed", "视频倍速（1–2，直播原速）")):
             while True:
                 raw = input(f"{label} [{common[name]}]，回车保留: ").strip()
                 candidate = dict(common)
@@ -303,7 +319,8 @@ def init_config():
 
 
 def init_chaoxing(common_config, tiku_config):
-    """初始化超星实例"""
+    """初始化超星实例；在读取凭据或连接题库前验证请求策略。"""
+    validate_request_settings(common_config)
     username = common_config.get("username", "")
     password = common_config.get("password", "")
     use_cookies = common_config.get("use_cookies", False)
@@ -344,7 +361,12 @@ def init_chaoxing(common_config, tiku_config):
     query_delay = tiku_config.get("delay", 0)
     
     # 实例化超星API
-    chaoxing = Chaoxing(account=account, tiku=tiku, query_delay=query_delay)
+    chaoxing = Chaoxing(
+        account=account, tiku=tiku, query_delay=query_delay,
+        request_interval=common_config["request_interval"],
+        request_jitter=common_config["request_jitter"],
+        cookie_cleanup_names=common_config["cookie_cleanup_names"],
+    )
     
     return chaoxing
 
@@ -397,7 +419,8 @@ def process_job(chaoxing: Chaoxing, course: dict, job: dict, job_info: dict, spe
             
             # process_job already runs in the chapter executor. Propagate the real
             # result instead of losing it inside an extra thread and reporting success.
-            return LiveProcessor.run_live(live, speed, stop_event=stop)
+            # Video speed settings never apply to live/replay tasks.
+            return LiveProcessor.run_live(live, 1.0, stop_event=stop)
         except ProgressError:
             raise
         except Exception as e:
@@ -437,7 +460,7 @@ class JobProcessor:
         self._error_lock = threading.Lock()
         self._stop_task = ChapterTask(-1, {})
         self.worker_num = min(config["jobs"], len(tasks))
-        logger.info("本轮设置：同时处理{}个未完成小节，媒体本地计时{}倍；小节内串行。", self.worker_num, self.speed)
+        logger.info("本轮设置：同时处理{}个未完成小节，视频本地计时{}倍，直播固定原速；小节内串行。", self.worker_num, self.speed)
         if self.worker_num > 1 or self.speed != 1:
             logger.warning("已选择非保守设置；并发/倍速可能影响平台认可，在线检测与进度核验仍启用。")
         self.config = config
@@ -678,14 +701,23 @@ def _print_section(section, depth):
         _print_section(child, depth + 1)
 
 
+def _get_course_point_with_policy(chaoxing, course):
+    """Guard one independent catalog read without starting answer workers."""
+    chaoxing.start_course(1, threading.Event(), prefetch_work=False)
+    try:
+        return chaoxing.get_course_point(
+            course["courseId"], course["clazzId"], course["cpi"]
+        )
+    finally:
+        chaoxing.finish_course()
+
+
 def process_course(chaoxing: Chaoxing, course:dict[str, Any], config: dict):
     """处理单个课程"""
     logger.info(f"开始学习课程: {course['title']}")
 
     # 获取当前课程的所有章节
-    point_list = chaoxing.get_course_point(
-        course["courseId"], course["clazzId"], course["cpi"]
-    )
+    point_list = _get_course_point_with_policy(chaoxing, course)
     progress = ProgressStore()
     progress.check_and_record(chaoxing.get_uid(), course, point_list.get("points"))
 
@@ -726,7 +758,7 @@ def process_course(chaoxing: Chaoxing, course:dict[str, Any], config: dict):
     if p.progress_error is not None:
         raise p.progress_error
     # Never rely on a finished thread or a write response as course completion.
-    refreshed = chaoxing.get_course_point(course["courseId"], course["clazzId"], course["cpi"])
+    refreshed = _get_course_point_with_policy(chaoxing, course)
     progress.check_and_record(chaoxing.get_uid(), course, refreshed.get("points"))
     confirmed = {str(point["id"]) for point in refreshed["points"] if point["has_finished"]}
     for task in tasks:

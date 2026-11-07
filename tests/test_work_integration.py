@@ -7,12 +7,15 @@ import enum
 import json
 import random
 import re
+import runpy
+from pathlib import Path
 import threading
 import unittest
 from collections import deque
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, field
+from http.cookiejar import Cookie, CookieJar
 from math import isfinite
 from queue import PriorityQueue
 from threading import Condition, Event, Thread, current_thread
@@ -100,7 +103,13 @@ class WorkIntegrationTests(unittest.TestCase):
             "_CANCEL_POLL_SECONDS": 0.05, "question_cache_key": self.key, "__name__": __name__})
         self.PreparedWork = prefetch["PreparedWork"]
         self.WorkPrefetcher = prefetch["WorkPrefetcher"]
-        methods = ["start_course", "finish_course", "_check_platform_response", "_wait_study",
+        policy = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'chaoxing/api/request_policy.py'))
+        self.save_cookies = Mock()
+        self.make_pacer = Mock(side_effect=lambda interval, jitter: SimpleNamespace(
+            interval=interval, jitter=jitter,
+            wait=Mock(side_effect=lambda stop: not stop.is_set())))
+        methods = ["start_course", "finish_course", "_cleanup_cookie_markers",
+                   "_check_platform_response", "_wait_study",
                    "_work_key", "prepare_work", "release_work", "_prepared_answers",
                    "_query_work_answers", "_fetch_work", "study_work"]
         namespace = load_units("chaoxing/api/base.py", ["StudyResult"] + [
@@ -108,6 +117,9 @@ class WorkIntegrationTests(unittest.TestCase):
         ], {"Enum": enum.Enum, "CancelledError": CancelledError, "ProgressError": ProgressError,
             "PreparedWork": self.PreparedWork,
             "WorkPrefetcher": self.WorkPrefetcher, "question_cache_key": self.key,
+            "RequestPacer": self.make_pacer, "RequestActivity": policy["RequestActivity"],
+            "validate_request_settings": policy["validate_request_settings"],
+            "clear_cookie_markers": policy["clear_cookie_markers"], "save_cookies": self.save_cookies,
             "check_answer": checks["check_answer"], "cut": checks["cut"], "re": re, "logger": self.logger,
             "requests": SimpleNamespace(exceptions=SimpleNamespace(RequestException=ConnectionError)),
             "SessionManager": SimpleNamespace(get_session=lambda: self.session),
@@ -152,6 +164,8 @@ class WorkIntegrationTests(unittest.TestCase):
         }))
 
     def start(self, *, enabled=True, capacity=2):
+        # Production run_course creates a fresh cancellation token per course.
+        self.stop = threading.Event()
         self.client.start_course(capacity, self.stop, prefetch_work=enabled)
         return self.client._work_prefetch
 
@@ -438,6 +452,228 @@ class WorkIntegrationTests(unittest.TestCase):
                 self.assertFalse(self.stop.is_set())
         self.assertEqual(len(responses), len(self.session.calls))
         self.session.cookies.clear.assert_not_called()
+
+
+    def add_cookie(self, name, domain='.chaoxing.com', path='/'):
+        self.session.cookies.set_cookie(Cookie(
+            version=0, name=name, value='offline', port=None, port_specified=False,
+            domain=domain, domain_specified=bool(domain), domain_initial_dot=domain.startswith('.'),
+            path=path, path_specified=True, secure=False, expires=None, discard=True,
+            comment=None, comment_url=None, rest={}))
+
+    def cookie_names(self):
+        return {(cookie.name, cookie.domain) for cookie in self.session.cookies}
+
+    def test_shared_pacing_is_used_for_each_course_request_with_custom_settings(self):
+        self.client.kwargs.update(jobs=7, speed=1.7, request_interval=0.75, request_jitter=0.1)
+        self.start(enabled=False)
+        self.session.responses.append(FakeResponse())
+        self.session.get('https://platform.invalid/directory')
+        self.session.post('https://platform.invalid/heartbeat')
+        self.make_pacer.assert_called_once_with(0.75, 0.1)
+        self.assertEqual(2, self.client._request_pacer.wait.call_count)
+        self.assertEqual(7, self.client.kwargs['jobs'])
+        self.assertEqual(1.7, self.client.kwargs['speed'])
+
+    def test_cancelled_pacing_never_admits_or_dispatches_http(self):
+        original = self.session.request
+        self.start(enabled=False)
+        self.client._request_pacer.wait.side_effect = None
+        self.client._request_pacer.wait.return_value = False
+        with self.assertRaises(ProgressError):
+            self.session.get('https://platform.invalid/work')
+        original.assert_not_called()
+        self.assertEqual(0, self.client._course_requests._active)
+
+    def test_stopped_startup_and_stacked_guards_are_rejected(self):
+        original = self.session.request
+        stop = threading.Event()
+        stop.set()
+        with self.assertRaises(ProgressError):
+            self.client.start_course(1, stop, prefetch_work=False)
+        self.make_pacer.assert_not_called()
+        self.assertIs(original, self.session.request)
+        self.start(enabled=False)
+        guard = self.session.request
+        with self.assertRaises(RuntimeError):
+            self.client.start_course(1, threading.Event(), prefetch_work=False)
+        self.assertIs(guard, self.session.request)
+        self.assertEqual(1, self.make_pacer.call_count)
+
+    def test_invalid_cleanup_names_fail_before_workers_or_cookie_access(self):
+        original = self.session.request
+        self.client.kwargs['cookie_cleanup_names'] = ['local_marker', 'JSESSIONID']
+        with self.assertRaises(ValueError):
+            self.start(enabled=False)
+        self.make_pacer.assert_not_called()
+        self.assertEqual([], self.session.cookies.mock_calls)
+        self.save_cookies.assert_not_called()
+        self.assertIs(original, self.session.request)
+
+    def test_named_startup_cleanup_runs_once_and_keeps_auth_and_foreign_domains(self):
+        self.session.cookies = CookieJar()
+        self.add_cookie('local_marker')
+        self.add_cookie('local_marker', 'other.invalid')
+        self.add_cookie('JSESSIONID')
+        self.client.kwargs['cookie_cleanup_names'] = ['local_marker']
+        self.start(enabled=False)
+        self.assertEqual({('local_marker', 'other.invalid'), ('JSESSIONID', '.chaoxing.com')},
+                         self.cookie_names())
+        self.save_cookies.assert_called_once_with(self.session)
+        self.client.finish_course()
+        self.add_cookie('local_marker')
+        self.start(enabled=False)
+        self.assertIn(('local_marker', '.chaoxing.com'), self.cookie_names())
+        self.assertEqual(1, self.save_cookies.call_count)
+
+    def test_explicit_rejection_defers_named_cleanup_until_finish_without_retry(self):
+        responses = [FakeResponse(status=status) for status in (401, 403, 429)]
+        responses.append(FakeResponse(
+            text='<html><title>验证码</title><form>验证码</form></html>', content_type='text/html'))
+        for response in responses:
+            with self.subTest(status=response.status_code, text=response.text):
+                self.session.cookies = CookieJar()
+                self.add_cookie('JSESSIONID')
+                self.add_cookie('local_marker', 'other.invalid')
+                self.client.kwargs['cookie_cleanup_names'] = ['local_marker']
+                original = self.session.request
+                original.reset_mock()
+                self.start(enabled=False)
+                self.add_cookie('local_marker')
+                self.save_cookies.reset_mock()
+                self.session.responses.append(response)
+                with self.assertRaises(ProgressError):
+                    self.session.get('https://platform.invalid/rejected')
+                self.assertTrue(self.stop.is_set())
+                self.assertTrue(self.client._cookie_cleanup_pending)
+                self.assertIn(('local_marker', '.chaoxing.com'), self.cookie_names())
+                self.save_cookies.assert_not_called()
+                with self.assertRaises(ProgressError):
+                    self.session.get('https://platform.invalid/no-retry')
+                original.assert_called_once()
+                self.client.finish_course()
+                self.assertEqual({('JSESSIONID', '.chaoxing.com'), ('local_marker', 'other.invalid')},
+                                 self.cookie_names())
+                self.save_cookies.assert_called_once_with(self.session)
+                self.assertIs(original, self.session.request)
+                self.client.finish_course()
+                self.assertEqual(1, self.save_cookies.call_count)
+
+    def test_ordinary_question_text_never_triggers_reactive_cookie_cleanup(self):
+        self.session.cookies = CookieJar()
+        self.client.kwargs['cookie_cleanup_names'] = ['local_marker']
+        self.start(enabled=False)
+        self.add_cookie('local_marker')
+        self.session.responses.append(FakeResponse({'questions': [
+            self.question(title='验证码属于哪类安全机制?')]}))
+        self.session.get('https://platform.invalid/questions')
+        self.assertFalse(self.stop.is_set())
+        self.assertFalse(self.client._cookie_cleanup_pending)
+        self.client.finish_course()
+        self.assertIn(('local_marker', '.chaoxing.com'), self.cookie_names())
+        self.save_cookies.assert_not_called()
+
+    def test_manual_cancellation_does_not_clear_new_cookie_markers(self):
+        self.session.cookies = CookieJar()
+        self.client.kwargs['cookie_cleanup_names'] = ['local_marker']
+        self.start(enabled=False)
+        self.add_cookie('local_marker')
+        self.stop.set()
+        self.client.finish_course()
+        self.assertIn(('local_marker', '.chaoxing.com'), self.cookie_names())
+        self.save_cookies.assert_not_called()
+
+    def test_request_exception_releases_activity_and_restores_the_guard(self):
+        original = self.session.request
+        original.side_effect = ConnectionError('offline connection failure')
+        self.start(enabled=False)
+        activity = self.client._course_requests
+        # Fail immediately, rather than stranding teardown, if drainage regresses.
+        activity.wait_for_idle = Mock(side_effect=lambda: self.assertEqual(0, activity._active))
+        with self.assertRaisesRegex(ConnectionError, 'offline connection failure'):
+            self.session.get('https://platform.invalid/work')
+        self.assertEqual(0, activity._active)
+        self.assertFalse(self.client._cookie_cleanup_pending)
+        self.client.finish_course()
+        self.assertIs(original, self.session.request)
+        activity.wait_for_idle.assert_called_once()
+        self.save_cookies.assert_not_called()
+
+    def test_persist_failure_restores_owned_guard_and_clears_lifecycle_state(self):
+        self.session.cookies = CookieJar()
+        self.client.kwargs['cookie_cleanup_names'] = ['local_marker']
+        original = self.session.request
+        self.start(enabled=False)
+        self.add_cookie('local_marker')
+        self.session.responses.append(FakeResponse(status=403))
+        with self.assertRaises(ProgressError):
+            self.session.get('https://platform.invalid/rejected')
+        self.save_cookies.side_effect = OSError('offline persistence failure')
+        with self.assertRaisesRegex(OSError, 'offline persistence failure'):
+            self.client.finish_course()
+        self.assertIs(original, self.session.request)
+        self.assertIsNone(self.client._course_session)
+        self.assertIsNone(self.client._request_pacer)
+        self.assertIsNone(self.client._course_requests)
+        self.assertIsNone(self.client.rate_limiter.stop_event)
+        self.assertIsNone(self.client.video_log_limiter.stop_event)
+        self.assertFalse(self.client._cookie_cleanup_pending)
+        self.client.finish_course()
+        original.assert_called_once()
+
+    def test_reactive_cleanup_waits_for_inflight_cookie_updates_and_keeps_the_fence(self):
+        self.session.cookies = CookieJar()
+        self.add_cookie('JSESSIONID')
+        self.client.kwargs['cookie_cleanup_names'] = ['local_marker']
+        entered, release, waiting = threading.Event(), threading.Event(), threading.Event()
+        def serve(method, url, **kwargs):
+            if url.endswith('/slow'):
+                entered.set()
+                if not release.wait(2):
+                    raise AssertionError('Test did not release in-flight response')
+                # Emulate Set-Cookie received after another request was already rejected.
+                self.add_cookie('local_marker')
+                return FakeResponse()
+            return FakeResponse(status=403)
+        original = self.session.request
+        original.side_effect = serve
+        self.start(enabled=False)
+        guard = self.session.request
+        activity = self.client._course_requests
+        original_wait = activity.wait_for_idle
+        def wait_for_idle():
+            waiting.set()
+            return original_wait()
+        activity.wait_for_idle = wait_for_idle
+        def persist(session):
+            self.assertIs(guard, session.request)
+            self.assertNotIn(('local_marker', '.chaoxing.com'), self.cookie_names())
+            self.assertIn(('JSESSIONID', '.chaoxing.com'), self.cookie_names())
+            with self.assertRaises(ProgressError):
+                session.get('https://platform.invalid/no-retry-from-cleanup')
+        self.save_cookies.side_effect = persist
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            slow = pool.submit(self.session.get, 'https://platform.invalid/slow')
+            try:
+                self.assertTrue(entered.wait(2))
+                with self.assertRaises(ProgressError):
+                    self.session.get('https://platform.invalid/rejected')
+                finish = pool.submit(self.client.finish_course)
+                self.assertTrue(waiting.wait(2))
+                self.assertFalse(finish.done())
+                self.assertIs(guard, self.session.request)
+                self.save_cookies.assert_not_called()
+                with self.assertRaises(ProgressError):
+                    self.session.get('https://platform.invalid/no-retry-while-draining')
+                self.assertEqual(2, original.call_count)
+            finally:
+                release.set()
+            self.assertIsInstance(slow.result(timeout=2), FakeResponse)
+            finish.result(timeout=2)
+        self.save_cookies.assert_called_once_with(self.session)
+        self.assertEqual(2, original.call_count)
+        self.assertIs(original, self.session.request)
+        self.assertIsNone(self.client._course_requests)
 
 
 class ProcessorLifecycleTests(unittest.TestCase):

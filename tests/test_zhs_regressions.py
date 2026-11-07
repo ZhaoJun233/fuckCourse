@@ -19,6 +19,34 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "zhs" / "fucker.py"
 
 
+class TestAuthenticationLogPrivacy(unittest.TestCase):
+    def test_cookie_and_qr_debug_calls_do_not_log_credentials(self):
+        tree = ast.parse(SOURCE.read_text(encoding="utf-8-sig"))
+        calls = []
+        for method in ast.walk(tree):
+            if not isinstance(method, ast.FunctionDef) or method.name not in {"cookies", "_qrlogin"}:
+                continue
+            for node in ast.walk(method):
+                if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                        and isinstance(node.func.value, ast.Name)
+                        and node.func.value.id == "logger" and node.func.attr == "debug"):
+                    calls.append(ast.Expr(value=node))
+        self.assertEqual(len(calls), 3)
+        cookie_secret = "SYNTHETIC_COOKIE_SECRET"
+        qr_secret = "SYNTHETIC_QR_SECRET"
+        logger = Mock()
+        namespace = {
+            "logger": logger, "qrToken": qr_secret,
+            "self": SimpleNamespace(cookies=cookie_secret, _cookies=cookie_secret),
+        }
+        module = ast.fix_missing_locations(ast.Module(body=calls, type_ignores=[]))
+        exec(compile(module, str(SOURCE), "exec"), namespace)
+        self.assertEqual(logger.debug.call_count, 3)
+        messages = repr(logger.debug.call_args_list)
+        self.assertNotIn(cookie_secret, messages)
+        self.assertNotIn(qr_secret, messages)
+
+
 class AttrDict(dict):
     def __init__(self, *args, default=None, **kwargs):
         super().__init__(*args, **kwargs)

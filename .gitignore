@@ -42,6 +42,7 @@ fuckCourse.code-workspace
 # Local indexes, credential backups and AI download caches
 .codegraph/
 .jspace/
+.dsh/
 *.bak
 AiDownloadCache/
 exam_reviews/

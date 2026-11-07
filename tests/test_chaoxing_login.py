@@ -1,5 +1,7 @@
 """Offline login regressions against actual Chaoxing definitions."""
+import runpy
 import sys
+from pathlib import Path
 import traceback
 import unittest
 from types import SimpleNamespace
@@ -138,6 +140,9 @@ class TestChaoxingLogin(unittest.TestCase):
     def test_initial_prompt_does_not_save_before_login(self):
         tiku = Mock()
         tiku.get_tiku_from_config.return_value = tiku
+        self.env["validate_request_settings"] = runpy.run_path(
+            str(Path(__file__).resolve().parents[1] / "chaoxing/api/request_policy.py")
+        )["validate_request_settings"]
         self.env.update({"Account": lambda u, p: SimpleNamespace(username=u, password=p),
                          "Tiku": lambda: tiku, "Chaoxing": Mock()})
         self.env["input"].side_effect = ["synthetic-user", "wrong-password"]

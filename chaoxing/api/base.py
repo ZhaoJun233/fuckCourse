@@ -40,6 +40,8 @@ from api.decode import (
 from api.exceptions import MaxRetryExceeded
 from api.online import OnlineDetectionError, OnlineMonitor, course_entry_signature
 from api.progress import ProgressError
+from api.request_policy import (RequestActivity, RequestPacer, clear_cookie_markers,
+                                validate_request_settings)
 from api.work_prefetch import WorkPrefetcher
 
 _progress_lock = threading.Lock()
@@ -275,45 +277,90 @@ class Chaoxing:
         self._online_detection_failed = False
         self._work_prefetch = None
         self._course_session = None
+        self._request_pacer = None
+        self._course_requests = None
+        self._cookie_cleanup_names = ()
+        self._cookie_cleanup_done = False
+        self._cookie_cleanup_pending = False
 
     def start_course(self, capacity, stop_event, *, prefetch_work=True):
-        """Own background queries and the platform request guard for one course."""
+        """Own independent queries and paced platform requests for one course."""
+        if getattr(self, "_course_session", None) is not None:
+            raise RuntimeError("上一轮课程尚未收尾，不能重复启动请求守卫。")
+        if stop_event.is_set():
+            raise ProgressError("本轮已停止，未启动新的课程任务。")
+        policy = dict(self.kwargs)
+        validate_request_settings(policy)
+        pacer = RequestPacer(policy["request_interval"], policy["request_jitter"])
+        activity = RequestActivity()
+        session = SessionManager.get_session()
+        self._cookie_cleanup_names = tuple(policy["cookie_cleanup_names"])
+        # Once at startup, not repeatedly during study. A block-triggered cleanup
+        # is deferred to finish_course, after in-flight responses have drained.
+        if not getattr(self, "_cookie_cleanup_done", False):
+            self._cleanup_cookie_markers(session, "启动前")
+            self._cookie_cleanup_done = True
+
         self._study_stop_event = stop_event
         self._course_session = None
+        self._request_pacer = pacer
+        self._course_requests = activity
+        self._cookie_cleanup_pending = False
         self.rate_limiter.stop_event = self.video_log_limiter.stop_event = stop_event
         self._work_prefetch = None
         if prefetch_work and self.tiku is not None and not self.tiku.DISABLE:
             self._work_prefetch = WorkPrefetcher(
                 self.tiku.query, capacity, stop_event,
                 query_delay=float(self.kwargs.get("query_delay", 0)))
-        session = SessionManager.get_session()
         original = session.request
 
         def guarded_request(method, url, **kwargs):
-            if stop_event.is_set():
+            if stop_event.is_set() or not pacer.wait(stop_event) or not activity.begin(stop_event):
                 raise ProgressError("本轮已停止，未发起新的平台请求。")
-            response = original(method, url, **kwargs)
-            self._check_platform_response(response)
-            return response
+            try:
+                response = original(method, url, **kwargs)
+                self._check_platform_response(response)
+                return response
+            finally:
+                activity.end()
 
         self._course_session = (session, original, guarded_request)
         session.request = guarded_request
 
+    def _cleanup_cookie_markers(self, session, reason):
+        removed = clear_cookie_markers(session.cookies, self._cookie_cleanup_names)
+        if removed:
+            save_cookies(session)  # The shared-store writer retains other platforms.
+            logger.info(f"{reason}按明确名单清理了 {removed} 项 Cookie；保留登录和验证凭证。")
+
     def finish_course(self):
+        stop = getattr(self, "_study_stop_event", None)
+        if stop is not None:
+            stop.set()
         try:
             if self._work_prefetch is not None:
                 self._work_prefetch.close()
         finally:
             self._work_prefetch = None
-            if self._course_session is not None:
-                session, original, guard = self._course_session
-                if session.request is guard:
-                    session.request = original
+            activity = getattr(self, "_course_requests", None)
+            if activity is not None:
+                activity.wait_for_idle()
+            owned = self._course_session
+            try:
+                if owned is not None and getattr(self, "_cookie_cleanup_pending", False):
+                    self._cleanup_cookie_markers(owned[0], "风控停止收尾时")
+            finally:
+                self._cookie_cleanup_pending = False
                 self._course_session = None
-            self.rate_limiter.stop_event = self.video_log_limiter.stop_event = None
+                if owned is not None:
+                    session, original, guard = owned
+                    if session.request is guard:
+                        session.request = original
+                self.rate_limiter.stop_event = self.video_log_limiter.stop_event = None
+                self._request_pacer = self._course_requests = None
 
     def _check_platform_response(self, response):
-        """Stop on explicit rejection; never discard cookies or retry alternate rt."""
+        """Stop on explicit rejection; defer named maintenance without retrying."""
         status = response.status_code
         url = str(getattr(response, "url", ""))
         login = "passport2.chaoxing.com/" in url and "login" in url.lower()
@@ -332,6 +379,13 @@ class Chaoxing:
             stop = getattr(self, "_study_stop_event", None)
             if stop is not None:
                 stop.set()
+            manager = getattr(self, "_work_prefetch", None)
+            if manager is not None:
+                manager.cancel()
+            if getattr(self, "_cookie_cleanup_names", ()):
+                self._cookie_cleanup_pending = True
+            # All in-flight responses must drain before changing the shared jar.
+            # Never retry, re-login or alter progress to bypass the restriction.
             raise ProgressError("平台拒绝访问、要求验证或限流，已停止本轮并保留待办；请在官方页面检查。")
 
     def _wait_study(self, seconds=0):

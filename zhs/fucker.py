@@ -152,14 +152,14 @@ class Fucker:
             cookies = list_to_cookie_jar(cookies)
         
         self._cookies = cookies
-        logger.debug(f'received cookies: {self.cookies}')
+        logger.debug('received cookies')
         if cookies:
             try:
                 self.uuid = json.loads(unquote(cookies["CASLOGC"]))["uuid"]
                 self._cookies[f"exitRecod_{self.uuid}"] = "2"
             except KeyError:
                 raise ValueError("Cookies invalid")
-        logger.debug(f"set cookies: {self._cookies}")
+        logger.debug("set cookies")
 
     def login(self, username: str=None, password: str=None, interactive: bool=True, use_qr:bool=False, qr_callback: callable=None):
         """* `interactive`: whether to use interactive mode to login"""
@@ -234,7 +234,7 @@ class Fucker:
                     f.write(img)
                 logger.info(f"图片已保存至{image_path}")
             qr_callback(img)
-            logger.debug(f"QR login received, token{qrToken}")
+            logger.debug("QR login received")
             scanned = False
             while True:
                 time.sleep(0.5)

@@ -274,13 +274,45 @@ class LiveProcessorTests(unittest.TestCase):
 
     def test_speed_does_not_fake_live_credit_or_double_divide_duration(self):
         intervals = []
-        for speed in (1, 2):
-            self.assertEqual(self.run_live([payload(), payload(percent=90)], speed=speed), StudyResult.SUCCESS)
-            intervals.append(self.wait.call_args.args[0])
-        self.assertEqual(intervals, [59, 59])
+        for speed in (1, 1.25, 2, 8):
+            with self.subTest(speed=speed):
+                self.assertEqual(self.run_live([payload(), payload(percent=90)], speed=speed), StudyResult.SUCCESS)
+                intervals.append(self.wait.call_args.args[0])
+                self.assertIn("固定 1 倍原速", str(self.emit.call_args_list))
+        self.assertEqual(intervals, [59, 59, 59, 59])
 
 
 class LiveSchedulerTests(unittest.TestCase):
+    def test_custom_video_speed_never_reaches_live_processor(self):
+        processor = Mock()
+        live = object()
+        env = {"logger": Mock(), "Live": Mock(return_value=live),
+               "LiveProcessor": processor, "StudyResult": StudyResult}
+        process = load_units("chaoxing/main.py", ["process_job"], env)["process_job"]
+        for speed in (1, 1.25, 1.75, 2):
+            with self.subTest(speed=speed):
+                stop = Event()
+                cx = Mock()
+                cx._study_stop_event = stop
+                processor.run_live.return_value = StudyResult.SUCCESS
+                self.assertEqual(process(cx, {"title": "测试课程"},
+                                         {"type": "live", "jobid": "TEST"}, {}, speed),
+                                 StudyResult.SUCCESS)
+                processor.run_live.assert_called_with(live, 1.0, stop_event=stop)
+
+    def test_custom_speed_still_reaches_video_processor(self):
+        env = {"logger": Mock(), "StudyResult": StudyResult}
+        process = load_units("chaoxing/main.py", ["process_job"], env)["process_job"]
+        for speed in (1.25, 1.75, 2):
+            with self.subTest(speed=speed):
+                cx = Mock()
+                cx._study_stop_event = Event()
+                cx.study_video.return_value = StudyResult.SUCCESS
+                course = {"title": "测试课程"}
+                job = {"type": "video", "jobid": "TEST"}
+                self.assertEqual(process(cx, course, job, {}, speed), StudyResult.SUCCESS)
+                cx.study_video.assert_called_once_with(course, job, {}, _speed=speed, _type="Video")
+
     def test_process_job_propagates_live_result_not_unconditional_success(self):
         processor = Mock()
         env = {'logger': Mock(), 'Live': Mock(), 'LiveProcessor': processor, 'StudyResult': StudyResult}

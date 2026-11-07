@@ -10,6 +10,7 @@ PLATFORM_SOURCES = (
     "chaoxing/api/logger.py", "chaoxing/api/notification.py",
     "chaoxing/api/exam.py", "chaoxing/api/exam_runner.py",
     "chaoxing/api/progress.py", "chaoxing/api/online.py", "chaoxing/api/work_prefetch.py",
+    "chaoxing/api/request_policy.py",
     "welearn/welearn_decompiled.py",
     "zhs/main.py", "zhs/fucker.py", "zhs/logger.py", "zhs/ObjDict.py",
     "zhs/push.py", "zhs/sign.py", "zhs/utils.py", "zhs/zd_utils.py",
@@ -46,12 +47,26 @@ def validate_archive_names(names):
     normalized = {name.replace("\\", "/") for name in names}
     expected = expected_project_entries()
     forbidden = []
+    private_directories = {".git", ".dsh", ".codegraph", ".jspace"}
+    private_files = {
+        "config.json", "cookies.json", "yuketang_config.json", "progress_state.json",
+        "credentials.json", "tokens.json", ".netrc", ".npmrc", ".pypirc",
+        ".git-credentials",
+    }
     for name in normalized:
         path = PurePosixPath(name)
+        parts = tuple(part.lower() for part in path.parts)
         basename = path.name.lower()
-        if path.parts and path.parts[0] in PLATFORM_DIRS and name not in expected:
+        private_path = any(
+            part in private_directories or part == ".env" or part.startswith(".env.")
+            for part in parts
+        )
+        session_export = (
+            basename.startswith("session.") and basename.endswith(".jsonl")
+        ) or (basename.startswith("dsh-session-") and basename.endswith(".zip"))
+        if private_path or session_export or basename in private_files or basename.endswith((".log", ".bak", ".har")):
             forbidden.append(name)
-        elif basename in {"config.json", "cookies.json", "yuketang_config.json", "progress_state.json"} or basename.endswith((".log", ".bak", ".har")):
+        elif parts and parts[0] in PLATFORM_DIRS and name not in expected:
             forbidden.append(name)
     missing = expected - normalized
     if forbidden or missing:

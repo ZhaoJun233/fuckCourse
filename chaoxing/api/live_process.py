@@ -29,7 +29,9 @@ class LiveProcessor:
         """Only replay permitted by the platform; never infer completion from elapsed time.
 
         An optional threading.Event interrupts waits and defers remaining requests.
+        The legacy speed argument is accepted, but live/replay always uses real time.
         """
+        speed = 1.0
         prefix = f"直播回放 {live.name}"
         notice = ""
         try:
@@ -48,7 +50,7 @@ class LiveProcessor:
             target = live.required_percent
             if snapshot.percent is None:
                 raise LiveError("无法读取平台观看进度，未继续处理。")
-            emit(f"回放完成目标 {target:g}%；显示的是平台确认进度，配置倍速不用于伪增直播累计时长。")
+            emit(f"回放完成目标 {target:g}%；固定 {speed:g} 倍原速，显示的是平台确认进度。")
             stalled = 0
             while True:
                 _draw_progress_bar(snapshot.duration * snapshot.percent / 100, snapshot.duration,
